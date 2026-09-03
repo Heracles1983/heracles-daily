@@ -663,7 +663,7 @@ export default function Home() {
   const pasteChangeTimer = useRef<number | null>(null);
 
   useEffect(() => {
-    queueMicrotask(() => {
+    const hydrationTimer = window.setTimeout(() => {
       try {
         const saved = window.localStorage.getItem("heracles-daily-v1");
         if (saved) {
@@ -683,8 +683,9 @@ export default function Home() {
         window.localStorage.removeItem("heracles-daily-history-v1");
       } catch { /* ignore malformed local draft */ }
       setHydrated(true);
-    });
+    }, 0);
     if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(() => undefined);
+    return () => window.clearTimeout(hydrationTimer);
   }, []);
   useEffect(() => {
     if (hydrated) window.localStorage.setItem("heracles-daily-v1", JSON.stringify(form));
