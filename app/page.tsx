@@ -37,7 +37,7 @@ const today = () => {
   return local.toISOString().slice(0, 10);
 };
 const emptyForm: FormState = {
-  date: today(), hrv: "", hrvBaseline: "", hrv3d: "", hrv7avg: "", hrv7sd: "",
+  date: "", hrv: "", hrvBaseline: "", hrv3d: "", hrv7avg: "", hrv7sd: "",
   sleep: "", timeInBed: "", rhr: "", rhrBaseline: "", atl: "", ctl: "", atlYesterday: "",
   atl3d: "", monotony: "", strain: "", density: "", strengthFrequency: "", workoutCount: "", workoutMinutes: "", workoutLoad: "", aerobicMinutes7: "", hardCycling36: "", evaluationAt: "", upperSets48: "", lowerSets48: "", pushSets48: "", pullSets48: "", legsSets48: "", pushSets7: "", pullSets7: "", legsSets7: "", strengthHistory: "", strengthFatigue: "unknown", fatiguePush: "unknown", fatiguePull: "unknown", fatigueLegs: "unknown", neural: "unknown",
   symptoms: "unknown", pain: "", painArea: "", energy: "", fatigue: "", motivation: "", stress: "",
@@ -677,6 +677,8 @@ export default function Home() {
             restored.fatigueLegs = legacy === "unknown" ? "unknown" : ["legs", "lower", "full"].includes(legacy) ? "yes" : "no";
           }
           setForm({ ...emptyForm, ...restored, date: today() });
+        } else {
+          setForm(current => ({ ...current, date: today() }));
         }
         window.localStorage.removeItem("heracles-daily-history-v1");
       } catch { /* ignore malformed local draft */ }
