@@ -31,6 +31,7 @@ type FormState = {
 };
 
 type ScoredMetric = { value: number; weight: number };
+const DAILY_SLEEP_NEED_HOURS = 7.5;
 const today = () => {
   const now = new Date();
   const local = new Date(now.getTime() - now.getTimezoneOffset() * 60_000);
@@ -729,7 +730,7 @@ export default function Home() {
       ...(sleepDurationScore === null ? [] : [{ value: sleepDurationScore, weight: .8 }]),
       ...(sleepEfficiencyScore === null ? [] : [{ value: sleepEfficiencyScore, weight: .2 }]),
     ]);
-    const sleepDebt3d = sleep3avg === null ? null : Math.max(0, (8 - sleep3avg) * 3);
+    const sleepDebt3d = sleep3avg === null ? null : Math.max(0, (DAILY_SLEEP_NEED_HOURS - sleep3avg) * 3);
     const rhrDelta = rhr !== null && rhrBaseline !== null ? rhr - rhrBaseline : null;
     const rhrScore = rhrDelta === null ? null : scoreRhr(rhrDelta);
     const recoveryParts = [hrvScore, sleepScore, rhrScore].filter(value => value !== null).length;
