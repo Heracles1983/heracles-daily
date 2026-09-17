@@ -7,12 +7,14 @@ import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, Di
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { assessCycling, assessmentTime, isCycling, parseCyclingSession, readCyclingHistory, wallTime, type CyclingSession } from "@/lib/cycling";
 
 type FormState = {
   date: string; hrv: string; hrvBaseline: string; hrv3d: string; hrv7avg: string; hrv7sd: string;
   sleep: string; timeInBed: string; rhr: string; rhrBaseline: string; atl: string; ctl: string;
   atlYesterday: string; atl3d: string; monotony: string; strain: string; density: string;
   strengthFrequency: string; workoutCount: string; workoutMinutes: string; workoutLoad: string; aerobicMinutes7: string; hardCycling36: string;
+  cyclingHistory: string; cyclingAsOf: string; cyclingManualKind: "none" | "hard" | "sprint"; cyclingManualEnd: string;
   evaluationAt: string; upperSets48: string; lowerSets48: string; pushSets48: string; pullSets48: string; legsSets48: string;
   pushSets7: string; pullSets7: string; legsSets7: string; strengthHistory: string;
   strengthFatigue: "unknown" | "none" | "push" | "pull" | "legs" | "upper" | "lower" | "full";
@@ -38,6 +40,7 @@ const today = () => {
   return local.toISOString().slice(0, 10);
 };
 const emptyForm: FormState = {
+  cyclingHistory: "", cyclingAsOf: "", cyclingManualKind: "none", cyclingManualEnd: "",
   date: "", hrv: "", hrvBaseline: "", hrv3d: "", hrv7avg: "", hrv7sd: "",
   sleep: "", timeInBed: "", rhr: "", rhrBaseline: "", atl: "", ctl: "", atlYesterday: "",
   atl3d: "", monotony: "", strain: "", density: "", strengthFrequency: "", workoutCount: "", workoutMinutes: "", workoutLoad: "", aerobicMinutes7: "", hardCycling36: "", evaluationAt: "", upperSets48: "", lowerSets48: "", pushSets48: "", pullSets48: "", legsSets48: "", pushSets7: "", pullSets7: "", legsSets7: "", strengthHistory: "", strengthFatigue: "unknown", fatiguePush: "unknown", fatiguePull: "unknown", fatigueLegs: "unknown", neural: "unknown",
@@ -80,7 +83,7 @@ const toneForScore = (score: number | null) => score === null ? "unknown" : scor
 const gaugeToneForScore = (score: number | null) => score === null ? "unknown" : score >= 90 ? "prime" : score >= 80 ? "high" : score >= 70 ? "moderate" : score >= 55 ? "low" : "poor";
 
 type StrengthGroup = "push" | "pull" | "legs" | "core";
-type StrengthHistoryItem = { name: string; canonicalName?: string; weight: number | null; unit: "kg" | "lbs" | "自重"; reps: number | null; sets: number; group: StrengthGroup; date: string; time: string; timestamp: number; sessionRpe: number; isWarmup?: boolean };
+type StrengthHistoryItem = { name: string; canonicalName?: string; weight: number | null; unit: "kg" | "lbs" | "自重"; reps: number | null; sets: number; group: StrengthGroup; date: string; time: string; timestamp: number; sessionRpe: number | null; isWarmup?: boolean };
 type ImportAudit = { evaluationAt: string; workouts: number; strengthSessions: number; excludedAfterEvaluation: number; exercises: StrengthHistoryItem[]; unparsed: string[] };
 type ParsedData = { values: Partial<FormState>; fields: string[]; audit?: ImportAudit };
 type PrescribedExercise = { name: string; prescription: string; rpe: string; rir: string; rest: string; source: string; progression: string };
@@ -253,42 +256,61 @@ function parseFullExport(source: string): ParsedData | null {
   if (recentSleep.length) save("sleep3avg", "近3日平均睡眠", rounded(mean(recentSleep)!));
 
   const workoutBlock = section("Workout list, each line is an entry of workout", ["ATL(Fatigue)"]);
-  type ParsedWorkout = { date: string; time: string; timestamp: number; type: string; duration: number; rpe: number; highZonePct: number; detail: string };
+  type ParsedWorkout = { date: string; time: string; timestamp: number; type: string; duration: number; rpe: number | null; detail: string };
   const workouts: ParsedWorkout[] = [];
+  const cyclingSessions: CyclingSession[] = [];
+  let cyclingParseIncomplete = false;
   const workoutEntries = workoutBlock.match(/^Type:[\s\S]*?(?=^Type:|(?![\s\S]))/gim) ?? [];
   for (const entry of workoutEntries) {
-    const match = /^Type:\s*([^,\n]+),\s*Date:\s*(\d{2}-\d{2})\s+(\d{2}):(\d{2}),\s*Duration:\s*(\d+(?:\.\d+)?)\s*mins,[^\n]*?RPE:\s*(\d+(?:\.\d+)?)/im.exec(entry);
-    if (!match) continue;
+    const match = /^Type:\s*([^,\n]+),\s*Date:\s*(\d{2}-\d{2})\s+(\d{2}):(\d{2}),\s*Duration:\s*(\d+(?:\.\d+)?)\s*mins\b/im.exec(entry);
+    if (!match) {
+      if (isCycling(/^Type:\s*([^,\n]+)/i.exec(entry)?.[1] ?? "")) cyclingParseIncomplete = true;
+      continue;
+    }
     const date = expandMonthDay(match[2]);
     const time = `${match[3]}:${match[4]}`;
-    const [year, month, day] = date.split("-").map(Number);
+    const timestamp = wallTime(`${date} ${time}`);
+    if (!Number.isFinite(timestamp) || Number(match[5]) <= 0) {
+      if (isCycling(match[1])) cyclingParseIncomplete = true;
+      continue;
+    }
     const detail = /Workout Tag:\s*([\s\S]*)/i.exec(entry)?.[1].trim() ?? "";
-    const zone4 = Number(/Zone 4:\s*(\d+(?:\.\d+)?)%/i.exec(entry)?.[1] ?? 0);
-    const zone5 = Number(/Zone 5:\s*(\d+(?:\.\d+)?)%/i.exec(entry)?.[1] ?? 0);
-    workouts.push({ type: match[1].trim(), date, time, timestamp: Date.UTC(year, month - 1, day, Number(match[3]), Number(match[4])), duration: Number(match[5]), rpe: Number(match[6]), highZonePct: zone4 + zone5, detail });
+    const rpeText = /\bRPE:\s*(\d+(?:\.\d+)?)/i.exec(entry)?.[1];
+    const rpe = rpeText !== undefined && Number(rpeText) <= 10 ? Number(rpeText) : null;
+    const workout = { type: match[1].trim(), date, time, timestamp, duration: Number(match[5]), rpe, detail };
+    if (workouts.some(item => item.timestamp === timestamp && item.type === workout.type && item.duration === workout.duration)) continue;
+    workouts.push(workout);
+    const cycling = parseCyclingSession(workout, entry);
+    if (cycling && cycling.end <= evaluationTimestamp && evaluationTimestamp - cycling.end < 7 * 86_400_000) cyclingSessions.push(cycling);
   }
-  const eligibleWorkouts = workouts.filter(workout => workout.timestamp <= evaluationTimestamp);
-  const hardCycling36 = eligibleWorkouts.filter(workout => /骑行/.test(workout.type) && evaluationTimestamp - workout.timestamp >= 0 && evaluationTimestamp - workout.timestamp <= 36 * 3_600_000 && (workout.rpe >= 7 || workout.highZonePct >= 10));
-  save("hardCycling36", "36小时高强度骑行", rounded(hardCycling36.length, 0));
+  const eligibleWorkouts = workouts.filter(workout => workout.timestamp + workout.duration * 60_000 <= evaluationTimestamp);
+  save("cyclingHistory", "骑行时长、强度区间与结束时点", JSON.stringify(cyclingSessions));
+  save("cyclingAsOf", "骑行评估时点", evaluationAt);
+  if (cyclingParseIncomplete) {
+    values.cyclingAsOf = "";
+    fields.push("骑行记录有未识别项，请核对时间与时长");
+  }
+  save("hardCycling36", "旧版骑行标记已迁移", "0");
   const recentWorkouts = eligibleWorkouts.filter(workout => {
     const age = (dayStamp(latestDate) - dayStamp(workout.date)) / 86_400_000;
     return age >= 1 && age <= 7;
   });
   if (recentWorkouts.length) {
     const totalMinutes = recentWorkouts.reduce((sum, workout) => sum + workout.duration, 0);
-    const totalLoad = recentWorkouts.reduce((sum, workout) => sum + workout.duration * workout.rpe, 0);
+    const allRpeKnown = recentWorkouts.every(workout => workout.rpe !== null);
+    const totalLoad = recentWorkouts.reduce((sum, workout) => sum + workout.duration * (workout.rpe ?? 0), 0);
     save("workoutCount", "7日训练次数", rounded(recentWorkouts.length, 0));
     save("workoutMinutes", "7日训练时长", rounded(totalMinutes, 0));
-    save("workoutLoad", "7日训练负荷", rounded(totalLoad));
+    if (allRpeKnown) save("workoutLoad", "7日训练负荷", rounded(totalLoad));
     save("strengthFrequency", "Strength Frequency", rounded(recentWorkouts.filter(workout => workout.type.includes("力量")).length, 0));
-    save("aerobicMinutes7", "7日有氧与专项时长", rounded(recentWorkouts.filter(workout => /骑行|游泳|划船|爬楼梯|椭圆机|步行|拳击|高强度间歇/.test(workout.type)).reduce((sum, workout) => sum + workout.duration, 0), 0));
+    save("aerobicMinutes7", "7日有氧与专项时长", rounded(recentWorkouts.filter(workout => isCycling(workout.type) || /游泳|划船|爬楼梯|椭圆机|步行|拳击|高强度间歇/.test(workout.type)).reduce((sum, workout) => sum + workout.duration, 0), 0));
     save("density", "Density", rounded(recentWorkouts.length / 7));
     const dailyLoads = Array.from({ length: 7 }, (_, index) => recentWorkouts
       .filter(workout => dayStamp(workout.date) === dayStamp(latestDate) - (index + 1) * 86_400_000)
-      .reduce((sum, workout) => sum + workout.duration * workout.rpe, 0));
+      .reduce((sum, workout) => sum + workout.duration * (workout.rpe ?? 0), 0));
     const averageLoad = mean(dailyLoads);
     const loadSd = populationSd(dailyLoads);
-    if (averageLoad !== null && loadSd !== null && loadSd > 0) {
+    if (allRpeKnown && averageLoad !== null && loadSd !== null && loadSd > 0) {
       const monotony = averageLoad / loadSd;
       save("monotony", "Monotony", rounded(monotony));
       save("strain", "Strain", rounded(dailyLoads.reduce((sum, load) => sum + load, 0) * monotony));
@@ -389,10 +411,10 @@ function parseFullExport(source: string): ParsedData | null {
   save("pullSets7", "7日拉训练正式组", rounded(pullSets7, 0));
   save("legsSets7", "7日腿训练正式组", rounded(legsSets7, 0));
   if (strengthHistory.length) save("strengthHistory", "力量动作与重量", JSON.stringify(strengthHistory.slice(0, 120)));
-  const hardStrength = strength48.some(workout => workout.rpe >= 7);
+  const hardStrength = strength48.some(workout => (workout.rpe ?? 0) >= 7);
   const groupSetPairs: Array<["push" | "pull" | "legs", number]> = [["push", pushSets48], ["pull", pullSets48], ["legs", legsSets48]];
   const fatiguedGroups = groupSetPairs.filter(([, sets]) => sets >= 8).map(([group]) => group);
-  const hardGroups = groupSetPairs.filter(([group]) => hardStrength && strength48.some(workout => workout.rpe >= 7 && countSets(workout.detail, group) > 0)).map(([group]) => group);
+  const hardGroups = groupSetPairs.filter(([group]) => hardStrength && strength48.some(workout => (workout.rpe ?? 0) >= 7 && countSets(workout.detail, group) > 0)).map(([group]) => group);
   const fatigueGroups = new Set([...fatiguedGroups, ...hardGroups]);
   save("fatiguePush", "48小时推疲劳", fatigueGroups.has("push") ? "yes" : "no");
   save("fatiguePull", "48小时拉疲劳", fatigueGroups.has("pull") ? "yes" : "no");
@@ -405,7 +427,7 @@ function parseFullExport(source: string): ParsedData | null {
   if (hardStrength && fatigueRegion === "none") fatigueRegion = [...groupSetPairs].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "full";
   save("strengthFatigue", "48小时力量疲劳", fatigueRegion);
 
-  return { values, fields, audit: { evaluationAt, workouts: workouts.length, strengthSessions: eligibleWorkouts.filter(item => item.type.includes("力量")).length, excludedAfterEvaluation: workouts.filter(item => item.timestamp > evaluationTimestamp).length, exercises: strengthHistory.slice(0, 24), unparsed: [...new Set(unparsedStrengthLines)].slice(0, 8) } };
+  return { values, fields, audit: { evaluationAt, workouts: workouts.length, strengthSessions: eligibleWorkouts.filter(item => item.type.includes("力量")).length, excludedAfterEvaluation: workouts.length - eligibleWorkouts.length, exercises: strengthHistory.slice(0, 24), unparsed: [...new Set(unparsedStrengthLines)].slice(0, 8) } };
 }
 
 export function parsePastedData(source: string): ParsedData {
@@ -651,48 +673,8 @@ function SegmentMeter({ value }: { value: number | null }) {
   return <div className="segment-meter" aria-label={value === null ? "Unknown" : `${Math.round(value)} / 100`}><span/><span/><span/><span/><span/><b style={{ left: `${Math.max(2, Math.min(98, value ?? 2))}%` }} /></div>;
 }
 
-export default function Home() {
-  const [form, setForm] = useState<FormState>(emptyForm);
-  const [hydrated, setHydrated] = useState(false);
-  const [pasteOpen, setPasteOpen] = useState(false);
-  const [pastedText, setPastedText] = useState("");
-  const [pasteStatus, setPasteStatus] = useState<{ kind: "success" | "error" | "info"; message: string } | null>(null);
-  const [importNotice, setImportNotice] = useState<string | null>(null);
-  const [lastImportFields, setLastImportFields] = useState<string[]>([]);
-  const [importAudit, setImportAudit] = useState<ImportAudit | null>(null);
-  const [auditOpen, setAuditOpen] = useState(false);
-  const pasteChangeTimer = useRef<number | null>(null);
-
-  useEffect(() => {
-    const hydrationTimer = window.setTimeout(() => {
-      try {
-        const saved = window.localStorage.getItem("heracles-daily-v1");
-        if (saved) {
-          const restored = JSON.parse(saved) as Partial<FormState>;
-          if (restored.preference === "upper" || restored.preference === "lower") restored.preference = "auto";
-          if (restored.strengthFatigue === "lower") restored.strengthFatigue = "legs";
-          if (!restored.fatiguePush || !restored.fatiguePull || !restored.fatigueLegs) {
-            const legacy = restored.strengthFatigue ?? "unknown";
-            restored.fatiguePush = legacy === "unknown" ? "unknown" : ["push", "upper", "full"].includes(legacy) ? "yes" : "no";
-            restored.fatiguePull = legacy === "unknown" ? "unknown" : ["pull", "upper", "full"].includes(legacy) ? "yes" : "no";
-            restored.fatigueLegs = legacy === "unknown" ? "unknown" : ["legs", "lower", "full"].includes(legacy) ? "yes" : "no";
-          }
-          setForm({ ...emptyForm, ...restored, date: today() });
-        } else {
-          setForm(current => ({ ...current, date: today() }));
-        }
-        window.localStorage.removeItem("heracles-daily-history-v1");
-      } catch { /* ignore malformed local draft */ }
-      setHydrated(true);
-    }, 0);
-    if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(() => undefined);
-    return () => window.clearTimeout(hydrationTimer);
-  }, []);
-  useEffect(() => {
-    if (hydrated) window.localStorage.setItem("heracles-daily-v1", JSON.stringify(form));
-  }, [form, hydrated]);
-
-  const result = useMemo(() => {
+export function evaluateReadiness(input: Partial<FormState>) {
+    const form = { ...emptyForm, ...input };
     const hrv = numberOrNull(form.hrv), hrvBaseline = numberOrNull(form.hrvBaseline);
     const hrv3d = numberOrNull(form.hrv3d), hrv7avg = numberOrNull(form.hrv7avg), hrv7sd = numberOrNull(form.hrv7sd);
     const sleep = numberOrNull(form.sleep), timeInBed = numberOrNull(form.timeInBed);
@@ -703,7 +685,8 @@ export default function Home() {
     const pushSets48 = numberOrNull(form.pushSets48) ?? 0, pullSets48 = numberOrNull(form.pullSets48) ?? 0, legsSets48 = numberOrNull(form.legsSets48) ?? numberOrNull(form.lowerSets48) ?? 0;
     const pushSets7 = numberOrNull(form.pushSets7) ?? 0, pullSets7 = numberOrNull(form.pullSets7) ?? 0, legsSets7 = numberOrNull(form.legsSets7) ?? 0;
     const aerobicMinutes7 = numberOrNull(form.aerobicMinutes7) ?? 0;
-    const hardCycling36 = (numberOrNull(form.hardCycling36) ?? 0) > 0;
+    const cyclingHistory = readCyclingHistory(form.cyclingHistory);
+    const legacyCyclingBlock = cyclingHistory === null && (numberOrNull(form.hardCycling36) ?? 0) > 0;
     let strengthHistory: StrengthHistoryItem[] = [];
     try {
       const savedHistory = form.strengthHistory ? JSON.parse(form.strengthHistory) as Array<StrengthHistoryItem & { region?: "upper" | "lower" }> : [];
@@ -793,7 +776,17 @@ export default function Home() {
     if (readiness !== null && neuralLimited) {
       readiness = Math.min(readiness, 79.99); limits.push("Neural Limited：最高 Level 3，禁止极限力量、冲刺、HIIT和高强度拳击");
     }
-    const evaluationTimestamp = Date.parse(`${(form.evaluationAt || `${form.date} 09:00`).replace(" ", "T")}Z`);
+    const evaluationTimestamp = assessmentTime(form.date, form.evaluationAt);
+    const cycling = assessCycling(cyclingHistory, evaluationTimestamp, { kind: form.cyclingManualKind, end: wallTime(form.cyclingManualEnd) });
+    const cyclingStale = form.cyclingAsOf.slice(0, 10) !== form.date;
+    const legsSore = lowerSoreness !== null && lowerSoreness >= 4;
+    const legsChecked = lowerSoreness !== null && lowerSoreness <= 2 && form.fatigueLegs === "no";
+    const legWarmupCleared = legsChecked && warmupRpeDelta !== null && warmupRpeDelta < 2 && warmupPain !== null && warmupPain <= 3
+      && form.movementQuality === "normal" && form.warmupHr !== "high" && form.warmupEnergy !== "worse";
+    const cyclingRecheck = cycling.reassess && !legWarmupCleared;
+    const manualCyclingInvalid = form.cyclingManualKind !== "none" && (!Number.isFinite(wallTime(form.cyclingManualEnd)) || wallTime(form.cyclingManualEnd) > evaluationTimestamp);
+    const cyclingUncertain = cycling.incomplete || cyclingStale || manualCyclingInvalid || !Number.isFinite(evaluationTimestamp);
+    const cyclingLegBlock = cycling.blocked || legacyCyclingBlock || cyclingRecheck || manualCyclingInvalid || cyclingUncertain && !legWarmupCleared;
     const recentStrengthExposure = (group: StrengthGroup, hours: number) => strengthHistory.some(item => !item.isWarmup && item.group === group && evaluationTimestamp - item.timestamp >= 0 && evaluationTimestamp - item.timestamp <= hours * 3_600_000);
     const pushCooldown = pushSets48 > 0 || recentStrengthExposure("push", 48);
     const pullCooldown = pullSets48 > 0 || recentStrengthExposure("pull", 48);
@@ -801,13 +794,17 @@ export default function Home() {
     const legsStrength36 = recentStrengthExposure("legs", 36);
     const pushFatigued = pushSets48 >= 8 || form.fatiguePush === "yes";
     const pullFatigued = pullSets48 >= 8 || form.fatiguePull === "yes";
-    const legsFatigued = legsSets48 >= 8 || form.fatigueLegs === "yes";
+    const legsFatigued = legsSets48 >= 8 || form.fatigueLegs === "yes" || cyclingLegBlock || legsSore;
     const fatiguedLabels = [pushFatigued ? "推" : "", pullFatigued ? "拉" : "", legsFatigued ? "腿" : ""].filter(Boolean);
-    if (fatiguedLabels.length) limits.push(`48小时局部力量疲劳：${fatiguedLabels.join("＋")}；保留其他无冲突部位`);
+    if (cycling.blocked) limits.push(`${cycling.reason}；窗口剩余约${Math.ceil(cycling.remainingHours)}小时，之后复查体感与热身`);
+    if (cyclingRecheck) limits.push("强骑已满48小时但尚未通过腿部体感与热身复查：暂缓腿力量和强骑");
+    if (legacyCyclingBlock) limits.push("旧版记录显示近期强骑，但缺少结束时点：先保留腿部限制，请重新导入原始报告");
+    if (cyclingUncertain && !legWarmupCleared && !cycling.blocked && !legacyCyclingBlock) limits.push("骑行资料不足：补齐骑行记录或通过腿部体感与热身检查后，再安排腿力量");
+    if (legsSore) limits.push("下肢酸痛≥4/5：不安排腿力量、节奏骑或冲刺；计时结束也不自动放行");
+    if (fatiguedLabels.length) limits.push(`局部疲劳/恢复限制：${fatiguedLabels.join("＋")}；保留其他无冲突部位`);
     const cooldownLabels = [pushCooldown ? "推" : "", pullCooldown ? "拉" : "", legsCooldown ? "腿" : ""].filter(Boolean);
     if (cooldownLabels.length) limits.push(`同部位力量刺激未满48小时：${cooldownLabels.join("＋")}；今天不重复安排同部位`);
     if (legsStrength36) limits.push("腿部力量训练后36小时：骑行仅限轻松Zone 1–2，不安排节奏、阈值或冲刺");
-    if (hardCycling36) limits.push("高强度骑行后36小时：不安排腿力量或腿部高强度训练");
     const warmupComplete = warmupRpeDelta !== null || warmupPain !== null || form.warmupHr !== "unknown" || form.movementQuality !== "unknown" || form.warmupEnergy !== "unknown";
     const warmupStop = (warmupPain !== null && warmupPain > 3) || form.movementQuality === "reduced";
     const warmupDowngrade = (warmupRpeDelta !== null && warmupRpeDelta >= 2) || form.warmupHr === "high" || form.warmupEnergy === "worse";
@@ -823,7 +820,10 @@ export default function Home() {
     const legsPainConflict = painActive && /膝|踝|髋|腿|下肢|腹股沟|腰/.test(form.painArea);
     const conflictPush = pushFatigued || pushCooldown;
     const conflictPull = pullFatigued || pullCooldown;
-    const conflictLegs = legsFatigued || legsCooldown || hardCycling36;
+    const conflictLegs = legsFatigued || legsCooldown;
+    const cyclingCooldown = legsStrength36 || conflictLegs || lowerSoreness !== null && lowerSoreness >= 3;
+    const cyclingTempoAllowed = readinessLevel.level !== null && readinessLevel.level >= 4 && !cyclingCooldown && !cyclingUncertain
+      && !legsPainConflict && !neuralLimited && !warmupDowngrade && !warmupStop;
     const groupInfo = {
       push: { label: "推", weekly: pushSets7, conflict: conflictPush, pain: pushPainConflict },
       pull: { label: "拉", weekly: pullSets7, conflict: conflictPull, pain: pullPainConflict },
@@ -889,7 +889,7 @@ export default function Home() {
       const empty = [] as PrescribedExercise[];
       if (readiness === null) return { title: "暂不生成训练处方", detail: "至少录入一组恢复数据后再决策；缺失项不会被默认正常。", dose: "补齐 HRV / 睡眠 / RHR 中的可用数据", exercises: empty, targetGroup: null as keyof typeof groupInfo | null };
       if (form.symptoms === "acute" || (pain !== null && pain > 3)) return { title: "恢复训练或完全休息", detail: "不安排相关部位训练。若症状持续、加重或出现胸痛、明显眩晕等情况，及时就医。", dose: "仅轻松活动 10–20 分钟（无症状加重时）", exercises: empty, targetGroup: null };
-      if (readinessLevel.level === 1) return { title: "主动恢复", detail: "步行、灵活性和呼吸练习；全程保持轻松，不追求训练量。", dose: "20–30 分钟｜RPE 1–2", exercises: empty, targetGroup: null };
+      if (readinessLevel.level === 1 || warmupStop) return { title: "主动恢复", detail: "步行、灵活性和呼吸练习；全程保持轻松，不追求训练量。", dose: "20–30 分钟｜RPE 1–2", exercises: empty, targetGroup: null };
       let target: FormState["preference"] = form.preference;
       if (target === "strength") target = chooseStrengthTarget() ?? "cycling";
       if (target === "upper") target = ["push", "pull"].filter(group => !groupInfo[group as "push" | "pull"].conflict && !groupInfo[group as "push" | "pull"].pain).sort((a, b) => groupInfo[a as "push" | "pull"].weekly - groupInfo[b as "push" | "pull"].weekly)[0] as "push" | "pull" ?? "cycling";
@@ -901,20 +901,25 @@ export default function Home() {
       }
       if ((target === "push" || target === "pull" || target === "legs") && (groupInfo[target].conflict || groupInfo[target].pain)) target = chooseStrengthTarget() ?? "cycling";
       if (target === "boxing" && ((painActive && /肩|肘|腕/.test(form.painArea)) || neuralLimited)) target = "cycling";
+      if ((target === "cycling" || target === "boxing" || target === "swimming") && (legsPainConflict || legsSore)) {
+        const upper = (["push", "pull"] as const).find(group => !groupInfo[group].conflict && !groupInfo[group].pain);
+        if (upper) target = upper;
+        else return { title: "休息与无痛轻活动", detail: "下肢疼痛或明显酸痛，且上肢也有冲突；不强行安排骑行、打腿或拳击步法。", dose: "按症状休息｜不追求训练量", exercises: empty, targetGroup: null };
+      }
+      if (target === "boxing" && cyclingCooldown) target = chooseStrengthTarget() ?? "cycling";
       const moderate = readinessLevel.level === 3;
       const lowTechnique = readinessLevel.level === 2;
-      const cyclingCooldown = legsStrength36 || hardCycling36;
       const strengthPlan = (group: keyof typeof groupInfo) => ({
         title: lowTechnique ? `轻量${groupInfo[group].label}技术训练` : `${groupInfo[group].label}力量训练`,
         detail: `7日${groupInfo[group].label}训练${groupInfo[group].weekly}组；按最近3次正式记录调节重量，避开精确48小时疲劳与疼痛冲突。`,
         dose: lowTechnique ? "25–35 分钟｜RPE 3–4" : moderate ? "40–50 分钟｜RPE 5–6" : "50–65 分钟｜RPE 6–7",
         exercises: strengthPrescription(group), targetGroup: group,
       });
-      if (lowTechnique && (target === "cycling" || target === "swimming" || target === "boxing")) return { title: "低强度骑行 Zone 2", detail: "当前没有可安全安排的力量部位，采用可交谈强度恢复。", dose: "30–40 分钟｜RPE 3", exercises: empty, targetGroup: null };
+      if (lowTechnique && (target === "cycling" || target === "swimming" || target === "boxing")) return { title: "恢复骑行（可改休息）", detail: "仅在下肢无痛、越骑越轻松时进行；不安排节奏、阈值或冲刺。", dose: "15–30 分钟｜RPE 1–2", exercises: empty, targetGroup: null };
       return {
         push: strengthPlan("push"), pull: strengthPlan("pull"), legs: strengthPlan("legs"),
-        cycling: { title: moderate || cyclingCooldown ? "低强度骑行 Zone 1–2" : "骑行有氧质量课", detail: cyclingCooldown ? (legsStrength36 ? "昨日腿部力量刺激仍在冷却：只做恢复性骑行，不安排节奏、阈值或冲刺。" : "近期高强度骑行仍在冷却：今天只做轻松转腿，不叠加腿部高强度。") : moderate ? "保持可交谈强度，不安排阈值或冲刺。" : "稳定有氧为主，中段加入3×6分钟节奏段，组间轻松骑3分钟。", dose: cyclingCooldown ? "25–40 分钟｜RPE 2–3" : moderate ? "35–45 分钟｜RPE 3–4" : "55–70 分钟｜RPE 5–6", exercises: empty, targetGroup: null },
-        swimming: { title: "技术型游泳", detail: "以划水效率和轻松连续游为主；肩部不适时改为骑行。", dose: moderate ? "30–40 分钟｜RPE 3–4" : "45–60 分钟｜RPE 5–6", exercises: empty, targetGroup: null },
+        cycling: { title: cyclingTempoAllowed ? "骑行有氧质量课" : "低强度骑行 Zone 1–2", detail: cyclingCooldown ? "腿部仍有恢复限制：仅无痛轻松转腿，可直接休息；不安排节奏、阈值、冲刺或低踏频高阻力。" : !cyclingTempoAllowed ? "当前仅安排轻松有氧；强度记录不足或准备度受限时不加入节奏段。" : "稳定有氧为主，中段加入3×6分钟节奏段，组间轻松骑3分钟。", dose: cyclingCooldown ? "15–30 分钟｜RPE 1–2" : !cyclingTempoAllowed ? "30–45 分钟｜RPE 2–3" : "55–70 分钟｜RPE 5–6", exercises: empty, targetGroup: null },
+        swimming: { title: "技术型游泳", detail: cyclingCooldown ? "腿部仍有恢复限制：仅轻松技术划水，不安排冲刺或强力打腿；肩部不适则休息。" : "以划水效率和轻松连续游为主；肩部不适时停止。", dose: cyclingCooldown ? "20–30 分钟｜RPE 2–3" : moderate ? "30–40 分钟｜RPE 3–4" : "45–60 分钟｜RPE 5–6", exercises: empty, targetGroup: null },
         boxing: { title: "拳击技术训练", detail: "步法、距离和技术组合为主；避免全力击打与高神经压力对抗。", dose: moderate ? "35–45 分钟｜RPE 4" : "50–60 分钟｜RPE 5–6", exercises: empty, targetGroup: null },
         auto: { title: "低强度骑行 Zone 2", detail: "保持可交谈强度。", dose: "35–45 分钟｜RPE 3–4", exercises: empty, targetGroup: null },
         upper: strengthPlan("pull"), lower: strengthPlan("legs"),
@@ -931,19 +936,19 @@ export default function Home() {
     const strengthFrequency = numberOrNull(form.strengthFrequency);
     const strengthFrequencyStatus = strengthFrequency === null ? "Unknown" : strengthFrequency <= 1 ? "频率偏低" : strengthFrequency <= 4 ? "合理" : strengthFrequency === 5 ? "偏高" : "过高";
     const fatigueStateLabel = (value: FormState["fatiguePush"]) => value === "yes" ? "疲劳" : value === "no" ? "可用" : "未知";
-    const fatigueSummary = `推${fatigueStateLabel(form.fatiguePush)} · 拉${fatigueStateLabel(form.fatiguePull)} · 腿${fatigueStateLabel(form.fatigueLegs)}`;
+    const fatigueSummary = `推${fatigueStateLabel(form.fatiguePush)} · 拉${fatigueStateLabel(form.fatiguePull)} · 腿${legsFatigued ? "受限" : fatigueStateLabel(form.fatigueLegs)}`;
     const fatigueKnown = [form.fatiguePush, form.fatiguePull, form.fatigueLegs].filter(value => value !== "unknown").length;
-    const fatigueScore = fatigueKnown === 0 ? null : fatiguedLabels.length === 3 ? 40 : fatiguedLabels.length ? 70 : fatigueKnown === 3 ? 85 : null;
-    const strengthScoreFor = (group: keyof typeof groupInfo) => readiness === null ? null : Math.max(0, Math.min(100,
+    const fatigueScore = fatiguedLabels.length === 3 ? 40 : fatiguedLabels.length ? 70 : fatigueKnown === 3 ? 85 : null;
+    const strengthScoreFor = (group: keyof typeof groupInfo) => readiness === null ? null : Math.max(0, Math.min(group === "legs" && conflictLegs ? 54 : 100,
       readiness
       - (groupInfo[group].conflict ? 18 : 0)
       - (groupInfo[group].pain ? (pain !== null && pain > 3 ? 30 : 12) : 0)
-      - (((group === "legs" ? lowerSoreness : upperSoreness) ?? 0) >= 7 ? 16 : ((group === "legs" ? lowerSoreness : upperSoreness) ?? 0) >= 4 ? 8 : 0)
+      - (((group === "legs" ? lowerSoreness : upperSoreness) ?? 0) >= 4 ? 16 : ((group === "legs" ? lowerSoreness : upperSoreness) ?? 0) >= 3 ? 8 : 0)
       - (neuralLimited ? 12 : 0)
       - (warmupDowngrade ? 12 : 0)
     ));
     const strengthGroupScores = { push: strengthScoreFor("push"), pull: strengthScoreFor("pull"), legs: strengthScoreFor("legs") };
-    const availableStrengthScores = groupOrder.filter(group => !groupInfo[group].pain).map(group => strengthGroupScores[group]).filter((score): score is number => score !== null);
+    const availableStrengthScores = groupOrder.filter(group => !groupInfo[group].pain && !groupInfo[group].conflict).map(group => strengthGroupScores[group]).filter((score): score is number => score !== null);
     const strengthScore = availableStrengthScores.length ? Math.max(...availableStrengthScores) : null;
     const aerobicScore = readiness === null ? null : Math.max(0, Math.min(100,
       readiness
@@ -954,6 +959,9 @@ export default function Home() {
     ));
     const strengthReadiness = strengthScore === null ? "Unavailable" : levelFor(strengthScore).label;
     const aerobicReadiness = aerobicScore === null ? "Unavailable" : levelFor(aerobicScore).label;
+    // Keep systemic/aerobic recovery separate. This cap is a local scheduling
+    // convention, not a second charge of cycling load against ATL/CTL.
+    const cyclingScore = aerobicScore === null ? null : Math.max(0, Math.min(cyclingCooldown || legsPainConflict ? 54 : cyclingUncertain ? 69 : 100, aerobicScore));
     const positives: string[] = [];
     if (sleepScore !== null && sleepScore >= 80) positives.push(`睡眠 ${sleep?.toFixed(2)}h，效率 ${sleepEfficiency?.toFixed(2)}%`);
     if (formScore !== null && formScore >= 80) positives.push(`Form ${formValue?.toFixed(2)}，疲劳已充分释放`);
@@ -964,7 +972,7 @@ export default function Home() {
     if (pain === null) limitations.push("今日疼痛未填写，建议性质为有条件成立");
     if (form.symptoms === "unknown") limitations.push("疾病症状未填写，不能默认正常");
     if (subjectiveScore !== null && subjectiveScore < 55) limitations.push(`主观状态偏低：晨检 ${subjectiveScore.toFixed(0)}/100`);
-    const suggestionType = subjectiveMissing || neuralStatus === "unknown" ? "有条件成立" : "确定";
+    const suggestionType = subjectiveMissing || neuralStatus === "unknown" || cyclingUncertain ? "有条件成立" : "确定";
     const decision = readinessLevel.level === null ? "等待数据" : readinessLevel.level >= 4 ? "正常训练" : readinessLevel.level === 3 ? "降量训练" : readinessLevel.level === 2 ? "恢复训练" : "完全休息";
     const uniqueLimitations = [...new Set(limitations)];
     const actionState = readinessLevel.level === null ? "WAIT" : readinessLevel.level >= 4 ? "TRAIN" : readinessLevel.level === 3 ? "MODIFY" : "RECOVER";
@@ -974,7 +982,11 @@ export default function Home() {
     if (pain !== null && (pain < 0 || pain > 10)) dataWarnings.push("疼痛评分应在 0–10 之间");
     if (atl !== null && atl < 0 || ctl !== null && ctl < 0) dataWarnings.push("ATL / CTL 不应为负值");
     if (neuralStatus === "unknown") dataWarnings.push("神经状态资料不足：保留 Unknown，不扣分也不封顶");
+    if (cyclingUncertain) dataWarnings.push("骑行强度记录不完整或不是今日导入：请重贴原始报告；不把缺失记录当作腿已恢复");
+    if (cycling.missingRpe) dataWarnings.push(`${cycling.missingRpe}次骑行缺少RPE：骑行负荷只展示已知部分，不用0代替缺失值`);
+    if (manualCyclingInvalid) dataWarnings.push("补充骑行的结束时间缺失或晚于评估时点，尚未计入；请修正时间");
     const chosenPlan = choosePlan();
+    const localRecoveryPlan = chosenPlan.title.includes("骑行") && cyclingCooldown;
     const preferenceLabels: Record<FormState["preference"], string> = { auto: "按规则推荐", strength: "力量优先", push: "推力量", pull: "拉力量", legs: "腿力量", upper: "上肢力量", lower: "下肢力量", cycling: "有氧优先", swimming: "游泳", boxing: "拳击" };
     const recommendationReason = form.preference !== "auto"
       ? `已优先考虑「${preferenceLabels[form.preference]}」；疼痛、疾病症状、神经限制和48小时局部疲劳仍可自动改写项目。`
@@ -992,8 +1004,53 @@ export default function Home() {
       sleepDebt3d, subjectiveScore, warmupComplete, warmupStop, warmupDowngrade, recoveryConfidence, strengthConfidence, aerobicConfidence,
       rhrDelta, rhrScore, recovery, formValue, formScore, acwr, acwrScore, atlSpike, atlSpikeScore, fatigueMomentum, load, monotonyScore, densityScore, structure,
       readiness, readinessLevel, completeness, completenessLabel, limits, neuralReady, neuralLimited, neuralStatus, neuralPressure, neuralTriggers, neuralKnownInputs, cnsFatigue, fatiguedLabels, fatigueSummary, fatigueScore, strengthFrequencyStatus, strengthScore, strengthGroupScores, aerobicScore, strengthReadiness,
-      aerobicReadiness, positives: positives.slice(0, 3), limitations: uniqueLimitations.slice(0, 3), allLimitations: uniqueLimitations, suggestionType, decision, actionState, keyLimiter, dataWarnings, recommendationReason, plan: chosenPlan };
-  }, [form]);
+      cycling, cyclingScore, cyclingCooldown, cyclingTempoAllowed, cyclingLegBlock, cyclingRecheck, cyclingUncertain,
+      aerobicReadiness, positives: positives.slice(0, 3), limitations: uniqueLimitations.slice(0, 3), allLimitations: uniqueLimitations, suggestionType,
+      decision: localRecoveryPlan ? "恢复性活动（腿部受限）" : decision, actionState: localRecoveryPlan ? "RECOVER" : actionState,
+      keyLimiter, dataWarnings, recommendationReason, plan: chosenPlan };
+}
+
+export default function Home() {
+  const [form, setForm] = useState<FormState>(emptyForm);
+  const [hydrated, setHydrated] = useState(false);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pastedText, setPastedText] = useState("");
+  const [pasteStatus, setPasteStatus] = useState<{ kind: "success" | "error" | "info"; message: string } | null>(null);
+  const [importNotice, setImportNotice] = useState<string | null>(null);
+  const [lastImportFields, setLastImportFields] = useState<string[]>([]);
+  const [importAudit, setImportAudit] = useState<ImportAudit | null>(null);
+  const [auditOpen, setAuditOpen] = useState(false);
+  const pasteChangeTimer = useRef<number | null>(null);
+
+  useEffect(() => {
+    const hydrationTimer = window.setTimeout(() => {
+      try {
+        const saved = window.localStorage.getItem("heracles-daily-v1");
+        if (saved) {
+          const restored = JSON.parse(saved) as Partial<FormState>;
+          if (restored.preference === "upper" || restored.preference === "lower") restored.preference = "auto";
+          if (restored.strengthFatigue === "lower") restored.strengthFatigue = "legs";
+          if (!restored.fatiguePush || !restored.fatiguePull || !restored.fatigueLegs) {
+            const legacy = restored.strengthFatigue ?? "unknown";
+            restored.fatiguePush = legacy === "unknown" ? "unknown" : ["push", "upper", "full"].includes(legacy) ? "yes" : "no";
+            restored.fatiguePull = legacy === "unknown" ? "unknown" : ["pull", "upper", "full"].includes(legacy) ? "yes" : "no";
+            restored.fatigueLegs = legacy === "unknown" ? "unknown" : ["legs", "lower", "full"].includes(legacy) ? "yes" : "no";
+          }
+          setForm({ ...emptyForm, ...restored, date: today() });
+        } else {
+          setForm(current => ({ ...current, date: today() }));
+        }
+        window.localStorage.removeItem("heracles-daily-history-v1");
+      } catch { /* ignore malformed local draft */ }
+      setHydrated(true);
+    }, 0);
+    if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(() => undefined);
+    return () => window.clearTimeout(hydrationTimer);
+  }, []);
+  useEffect(() => {
+    if (hydrated) window.localStorage.setItem("heracles-daily-v1", JSON.stringify(form));
+  }, [form, hydrated]);
+  const result = useMemo(() => evaluateReadiness(form), [form]);
 
   const update = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm(current => ({ ...current, [key]: value }));
   const reset = () => { setForm({ ...emptyForm, date: today() }); setImportNotice(null); setLastImportFields([]); setImportAudit(null); setAuditOpen(false); window.localStorage.removeItem("heracles-daily-v1"); };
@@ -1013,7 +1070,9 @@ export default function Home() {
     const resetUnknownSubjectives = /Workout list, each line is an entry of workout/i.test(source)
       ? { neural: "unknown" as const, symptoms: "unknown" as const, pain: "", painArea: "", energy: "", fatigue: "", motivation: "", stress: "", upperSoreness: "", lowerSoreness: "", sleepQuality: "", warmupRpeDelta: "", warmupPain: "", warmupHr: "unknown" as const, movementQuality: "unknown" as const, warmupEnergy: "unknown" as const, firstSetRir: "", aerobicMinutes7: "", hardCycling36: "", evaluationAt: "", upperSets48: "", lowerSets48: "", pushSets48: "", pullSets48: "", legsSets48: "", pushSets7: "", pullSets7: "", legsSets7: "", strengthHistory: "", strengthFatigue: "unknown" as const, fatiguePush: "unknown" as const, fatiguePull: "unknown" as const, fatigueLegs: "unknown" as const }
       : {};
-    setForm(current => ({ ...current, ...resetUnknownSubjectives, ...parsed.values }));
+    setForm(current => ({ ...current, ...resetUnknownSubjectives,
+      ...(/Workout list, each line is an entry of workout/i.test(source) ? { cyclingHistory: "", cyclingAsOf: "", cyclingManualKind: "none" as const, cyclingManualEnd: "", workoutLoad: "", monotony: "", strain: "" } : {}),
+      ...parsed.values }));
     const importedDate = parsed.values.date ? `（${parsed.values.date}）` : "";
     setImportNotice(`识别完成${importedDate}：已填入 ${parsed.fields.length} 项，准备度已更新。`);
     setLastImportFields(parsed.fields);
@@ -1081,7 +1140,7 @@ export default function Home() {
           return item;
         });
         const nextForm = { ...currentForm, strengthHistory: JSON.stringify(nextHistory) };
-        const evaluationTimestamp = Date.parse(`${(currentForm.evaluationAt || `${currentForm.date} 09:00`).replace(" ", "T")}Z`);
+        const evaluationTimestamp = assessmentTime(currentForm.date, currentForm.evaluationAt);
         const latestDay = Date.parse(`${currentForm.date}T00:00:00Z`);
         const in48h = (item: StrengthHistoryItem) => Number.isFinite(evaluationTimestamp) && evaluationTimestamp - item.timestamp >= 0 && evaluationTimestamp - item.timestamp <= 48 * 3_600_000;
         const in7d = (item: StrengthHistoryItem) => {
@@ -1291,8 +1350,34 @@ export default function Home() {
 
         </div>
         </details>
-        <p className="dashboard-note">评估时点 {form.evaluationAt || `${form.date} 训练前`}　｜　数据完整度 {result.completenessLabel} · {result.completeness}%　｜　{result.suggestionType}　｜　力量与有氧分数为专项模型估算，ACWR不参与评分；不代表 WHOOP、Garmin 官方算法或医学诊断。</p>
+        <p className="dashboard-note">评估时点 {form.evaluationAt.startsWith(form.date) ? form.evaluationAt : `${form.date} 09:00`}　｜　数据完整度 {result.completenessLabel} · {result.completeness}%　｜　{result.suggestionType}　｜　力量与有氧分数为模型估算，ACWR不参与评分；不代表 WHOOP、Garmin 官方算法或医学诊断。</p>
       </section>
+
+      <ReportSection icon={<Activity />} title="骑行与腿部恢复" subtitle={result.cyclingLegBlock ? "暂缓腿力量与强骑；其他部位独立判断" : "骑行负荷与力量组数分开记录"}>
+        <div className="analysis-card">
+          <DashboardRow label="骑行专项准备度" value={display(result.cyclingScore, " / 100")} score={result.cyclingScore} note={result.cyclingTempoAllowed ? "当前允许有氧质量课" : "不安排节奏、阈值、冲刺或低踏频高阻力"} />
+          <DashboardRow label="骑行恢复窗口" value={result.cycling.blocked ? `剩余约${Math.ceil(result.cycling.remainingHours)}小时` : result.cyclingRecheck ? "待体感与热身复查" : result.cyclingUncertain ? "资料不足" : "未触发计时限制"} score={null} note={result.cycling.reason || "到时不代表自动恢复；下肢酸痛和热身反馈仍优先"} />
+          <DashboardRow label="骑行负荷（已知部分）" value={`48h ${display(result.cycling.load48)} · 7日 ${display(result.cycling.load7)} AU`} score={null} note={`每次分钟×整节RPE；7日骑行${display(result.cycling.minutes7)}分钟${result.cycling.missingRpe ? `；${result.cycling.missingRpe}次缺RPE未计入` : ""}。不重复加到ATL/CTL，不换算腿部组数。`} />
+        </div>
+        <details className="recommendation-reason">
+          <summary>查看每次骑行与判定依据</summary>
+          {result.cycling.sessions.length ? result.cycling.sessions.map(ride => <article className="analysis-card" key={`${ride.start}-${ride.duration}`}>
+            <h3>{new Date(ride.end).toISOString().slice(5, 16).replace("T", " ")} 结束 · {ride.label}</h3>
+            <p>{ride.duration}分钟 · RPE {ride.rpe ?? "未知"} · 负荷 {display(ride.load)} AU · 距评估 {ride.ageHours.toFixed(1)}小时</p>
+            <p>功率 Z4–7：{display(ride.powerHigh, "分钟", 1)}；其中 Z6–7：{display(ride.powerSprint, "分钟", 1)}。心率 Z4–5：{display(ride.hrHigh, "分钟", 1)}。</p>
+            <p>{ride.reason}</p>
+          </article>) : <p>{result.cyclingUncertain ? "尚无完整骑行记录，请重新粘贴原始导出。旧版只保存36小时次数，无法还原功率区间。" : "本次导入的近7日记录中未识别到骑行。"}</p>}
+          <p>48小时/24小时及负荷阈值是保守排课默认值，不是医学测定的恢复时间。心率高区不等于无氧功率区；功率区间依赖正确的FTP设置。</p>
+        </details>
+        <details className="input-card">
+          <summary><Activity/><div><strong>补充漏记的强骑/冲刺</strong><span>无功率数据、平均心率没反映冲刺时使用</span></div></summary>
+          <div className="field-grid">
+            <SelectField label="补充骑行类型" value={form.cyclingManualKind} onChange={v => update("cyclingManualKind", v as FormState["cyclingManualKind"])} options={[["none","无补充"],["hard","高强度骑行"],["sprint","反复冲刺 / 高扭矩"]]} />
+            <label className="field"><span>该次骑行结束时间</span><Input type="datetime-local" aria-label="该次骑行结束时间" value={form.cyclingManualEnd} onChange={e => update("cyclingManualEnd", e.target.value)} /></label>
+          </div>
+          <p className="compact-help">只补充恢复限制，不再次累加训练负荷。按报告同一时区填写，必须早于评估时点；下一次完整导入会清除这项补充。</p>
+        </details>
+      </ReportSection>
 
       <details className="quick-subjective compact-details" aria-label="今日主观状态晨检">
         <summary><div><span>MORNING CHECK</span><h2>30秒晨间体感</h2></div><strong>{result.subjectiveScore === null ? "待填写" : `${Math.round(result.subjectiveScore)}/100`}</strong></summary>
@@ -1329,10 +1414,10 @@ export default function Home() {
           <div><span>{result.decision}</span><h3>{result.plan.title}</h3><p>{result.plan.detail}</p></div>
           <strong>{result.plan.dose}</strong>
         </article>
-        <div className="plan-safety"><ShieldAlert/><div><span>关键限制</span><strong>{result.keyLimiter}</strong><small>避免：{result.neuralLimited ? "高强度与极限输出" : form.painArea ? `${form.painArea} 疼痛动作` : "无计划极限测试"}</small></div></div>
+        <div className="plan-safety"><ShieldAlert/><div><span>关键限制</span><strong>{result.keyLimiter}</strong><small>避免：{result.cyclingCooldown ? "腿部高强度、节奏骑、冲刺与低踏频高阻力" : result.neuralLimited ? "高强度与极限输出" : form.painArea ? `${form.painArea} 疼痛动作` : "无计划极限测试"}</small></div></div>
         <details className="recommendation-reason"><summary>查看推荐依据</summary><p>{result.recommendationReason}</p></details>
         <div className="session-plan merged-plan"><h3>{result.plan.targetGroup ? "力量处方" : "执行步骤"}</h3>
-          {result.plan.title.includes("骑行") ? <ol><li>热身：10–15 分钟轻松骑，RPE 2–3。</li><li>主训练：连续 Zone 2，保持可完整对话；仅当今日建议为正常训练时，加入 3×6 分钟节奏段，组间轻松骑 3 分钟。</li><li>总时长：{result.plan.dose.split("｜")[0]}；全程不冲刺、不力竭。</li><li>放松：8–10 分钟逐步降低踏频和心率。</li></ol>
+          {result.plan.title.includes("骑行") ? <CyclingSteps tempoAllowed={result.cyclingTempoAllowed} recovering={result.cyclingCooldown} dose={result.plan.dose} />
             : result.plan.targetGroup ? <>
               <ol><li>热身：10–15分钟动态活动，每个首个复合动作完成2–4组递增热身。</li><li>下面重量来自你最近一次可识别记录，并已按今日准备度降载；若设备或动作口径不同，以目标RPE和RIR为准。</li></ol>
               <div className="rir-calibration"><div><span>首个正式组校准</span><strong>{form.firstSetRir === "" ? "完成第一组后填写 RIR" : `RIR ${form.firstSetRir}${form.firstSetRir === "5" ? "+" : ""} · 处方已更新`}</strong><small>整节训练RPE只作参考，不再触发自动加重。</small></div><div role="group" aria-label="首个正式组RIR">{[0,1,2,3,4,5].map(value => <button key={value} type="button" className={form.firstSetRir === String(value) ? "active" : ""} onClick={() => update("firstSetRir", form.firstSetRir === String(value) ? "" : String(value))}>{value === 5 ? "5+" : value}</button>)}</div></div>
@@ -1342,7 +1427,7 @@ export default function Home() {
               <details className="progression-details"><summary>查看重量历史与进阶依据</summary><div>{result.plan.exercises.map((exercise, index) => <article key={`${exercise.name}-basis-${index}`}><strong>{exercise.name}</strong><small>{exercise.source}</small><p>{exercise.progression}</p></article>)}</div></details>
               <p className="strength-rule">当首个正式组RPE高出目标≥2、疼痛增加或动作代偿时：重量再降10%–15%；疼痛＞3/10立即停止相关动作。</p>
             </>
-            : result.plan.title.includes("游泳") ? <ol><li>热身：300–500m 轻松游＋技术划水，RPE 2–3。</li><li>主训练：以技术效率和连续有氧为主；肩部出现疼痛、无力或动作代偿时立即降量或结束。</li><li>按 {result.plan.dose} 执行，不安排全力冲刺或高乳酸组。</li><li>放松：200–300m 轻松游，结束后复查肩部感觉。</li></ol>
+            : result.plan.title.includes("游泳") ? <ol><li>热身：轻松技术划水，RPE 2–3。</li><li>主训练：以技术效率为主；肩部出现疼痛、无力或动作代偿时立即降量或结束。{result.cyclingCooldown ? "腿部恢复窗口内不做强力打腿或冲刺。" : ""}</li><li>按 {result.plan.dose} 执行，不安排全力冲刺或高乳酸组。</li><li>放松：轻松划水，结束后复查肩部感觉。</li></ol>
             : result.plan.title.includes("拳击") ? <ol><li>热身：10–15 分钟步法、影子拳和关节动态活动。</li><li>主训练：距离、步法、组合技术和轻强度靶练为主，避免全力击打和高强度对抗。</li><li>按 {result.plan.dose} 执行；肩、肘、腕或神经疲劳信号升高时立即降档。</li><li>结束前用 5–8 分钟低强度技术动作恢复呼吸和节奏。</li></ol>
             : <ol><li>先静息检查症状；胸痛、异常气短、头晕、神经症状或明显关节痛时完全休息并考虑就医。</li><li>仅在症状不加重时进行轻松步行、呼吸和灵活性练习。</li><li>全程 RPE 1–2，不追求时长、训练量或热量消耗。</li><li>任何不适增加立即终止。</li></ol>}
         </div>
@@ -1387,7 +1472,6 @@ export default function Home() {
             <Field label="Density 近7日" value={form.density} onChange={v => update("density", v)} />
             <Field label="Strength Frequency" value={form.strengthFrequency} onChange={v => update("strengthFrequency", v)} /><Field label="7日训练次数" value={form.workoutCount} onChange={v => update("workoutCount", v)} />
             <Field label="7日有氧/专项分钟" value={form.aerobicMinutes7} onChange={v => update("aerobicMinutes7", v)} unit="min" />
-            <Field label="36h高强度骑行次数" value={form.hardCycling36} onChange={v => update("hardCycling36", v)} unit="次" step="1" />
             <Field label="48h推正式组" value={form.pushSets48} onChange={v => update("pushSets48", v)} /><Field label="48h拉正式组" value={form.pullSets48} onChange={v => update("pullSets48", v)} /><Field label="48h腿正式组" value={form.legsSets48} onChange={v => update("legsSets48", v)} />
             <Field label="7日推正式组" value={form.pushSets7} onChange={v => update("pushSets7", v)} /><Field label="7日拉正式组" value={form.pullSets7} onChange={v => update("pullSets7", v)} /><Field label="7日腿正式组" value={form.legsSets7} onChange={v => update("legsSets7", v)} />
             <SelectField label="48h推疲劳" value={form.fatiguePush} onChange={v => update("fatiguePush", v as FormState["fatiguePush"])} options={[["unknown","Unknown"],["no","可训练"],["yes","疲劳 / 回避"]]} />
@@ -1419,11 +1503,14 @@ export default function Home() {
         </aside>
       </section>
       </details>
-      <footer><span>HERACLES DAILY · v4.7</span><span>纯前端规则引擎 · 数据仅保存在当前浏览器</span></footer>
+      <footer><span>HERACLES DAILY · v4.8</span><span>纯前端规则引擎 · 数据仅保存在当前浏览器</span></footer>
     </main>
   );
 }
 
+export function CyclingSteps({ tempoAllowed, recovering, dose }: { tempoAllowed: boolean; recovering: boolean; dose: string }) {
+  return <ol><li>热身：{recovering ? "5分钟无痛轻松转腿，RPE 1–2。" : "10分钟轻松骑。"}</li><li>{tempoAllowed ? "主训练：稳定有氧，中段可加入3×6分钟节奏段，组间轻松骑3分钟。" : "主训练：仅轻松Zone 1–2，不安排节奏、阈值、冲刺或低踏频高阻力；腿沉或疼痛增加就结束，可直接休息。"}</li><li>总时长：{dose.split("｜")[0]}（包含热身和放松）；全程不力竭。</li><li>放松：最后5分钟逐步降低强度。</li></ol>;
+}
 function InputCard({ icon, title, subtitle, children }: { icon: React.ReactNode; title: string; subtitle: string; children: React.ReactNode }) {
   return <details className="input-card" open><summary>{icon}<div><strong>{title}</strong><span>{subtitle}</span></div></summary><div className="field-grid">{children}</div></details>;
 }
