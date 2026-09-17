@@ -16,6 +16,7 @@ const power = (values) => values.map((n, i) => `Power Zone ${i + 1}: ${n}%`).joi
 const hr = (values) => values.map((n, i) => `Zone ${i}: ${n}%`).join(", ");
 const ride = ({ hoursAgo = 20, duration = 60, rpe = 4, type = "户外骑行", text = "" } = {}) => parseCyclingSession({ type, timestamp: at - hoursAgo * HOUR - duration * 60_000, duration, rpe }, text);
 const good = {
+  activityHistory: "[]", activityAsOf: "2026-09-17 09:00",
   date: "2026-09-17", evaluationAt: "2026-09-17 09:00", cyclingAsOf: "2026-09-17 09:00", cyclingHistory: "[]",
   hrv: "65", hrvBaseline: "65", hrv3d: "65", hrv7avg: "65", hrv7sd: "5", sleep: "7.5", timeInBed: "8", sleep3avg: "7.5",
   rhr: "50", rhrBaseline: "50", atl: "80", ctl: "100", atlYesterday: "80", monotony: "1", density: "0.8",

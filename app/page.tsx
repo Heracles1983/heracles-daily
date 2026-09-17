@@ -8,8 +8,10 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { assessCycling, assessmentTime, isCycling, parseCyclingSession, readCyclingHistory, wallTime, type CyclingSession } from "@/lib/cycling";
+import { activityGroups, assessActivityLoad, isAerobicActivity, readActivityHistory, type ActivitySession } from "@/lib/activity-load";
 
 type FormState = {
+  fieldDates: string; activityHistory: string; activityAsOf: string; sleepDays3: string;
   date: string; hrv: string; hrvBaseline: string; hrv3d: string; hrv7avg: string; hrv7sd: string;
   sleep: string; timeInBed: string; rhr: string; rhrBaseline: string; atl: string; ctl: string;
   atlYesterday: string; atl3d: string; monotony: string; strain: string; density: string;
@@ -28,7 +30,7 @@ type FormState = {
   warmupHr: "unknown" | "normal" | "high" | "low";
   movementQuality: "unknown" | "normal" | "reduced";
   warmupEnergy: "unknown" | "better" | "same" | "worse";
-  firstSetRir: string;
+  firstSetRir: string; firstSetWeight: string; firstSetExercise: string;
   preference: "auto" | "strength" | "push" | "pull" | "legs" | "upper" | "lower" | "cycling" | "swimming" | "boxing";
 };
 
@@ -40,14 +42,65 @@ const today = () => {
   return local.toISOString().slice(0, 10);
 };
 const emptyForm: FormState = {
+  fieldDates: "", activityHistory: "", activityAsOf: "", sleepDays3: "",
   cyclingHistory: "", cyclingAsOf: "", cyclingManualKind: "none", cyclingManualEnd: "",
   date: "", hrv: "", hrvBaseline: "", hrv3d: "", hrv7avg: "", hrv7sd: "",
   sleep: "", timeInBed: "", rhr: "", rhrBaseline: "", atl: "", ctl: "", atlYesterday: "",
   atl3d: "", monotony: "", strain: "", density: "", strengthFrequency: "", workoutCount: "", workoutMinutes: "", workoutLoad: "", aerobicMinutes7: "", hardCycling36: "", evaluationAt: "", upperSets48: "", lowerSets48: "", pushSets48: "", pullSets48: "", legsSets48: "", pushSets7: "", pullSets7: "", legsSets7: "", strengthHistory: "", strengthFatigue: "unknown", fatiguePush: "unknown", fatiguePull: "unknown", fatigueLegs: "unknown", neural: "unknown",
   symptoms: "unknown", pain: "", painArea: "", energy: "", fatigue: "", motivation: "", stress: "",
   upperSoreness: "", lowerSoreness: "", sleepQuality: "", sleep3avg: "", warmupRpeDelta: "", warmupPain: "",
-  warmupHr: "unknown", movementQuality: "unknown", warmupEnergy: "unknown", firstSetRir: "", preference: "auto",
+  warmupHr: "unknown", movementQuality: "unknown", warmupEnergy: "unknown", firstSetRir: "", firstSetWeight: "", firstSetExercise: "", preference: "auto",
 };
+
+// Daily observations expire together; dated workout history remains available.
+const persistentFields = new Set<keyof FormState>(["date", "preference", "fieldDates", "strengthHistory", "cyclingHistory", "cyclingAsOf", "cyclingManualKind", "cyclingManualEnd", "activityHistory", "activityAsOf"]);
+const dailyFields = (Object.keys(emptyForm) as Array<keyof FormState>).filter(key => !persistentFields.has(key));
+function readFieldDates(raw: string): Record<string, string> {
+  try {
+    const data = JSON.parse(raw);
+    if (data && typeof data === "object" && !Array.isArray(data)) return Object.fromEntries(Object.entries(data).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+  } catch { /* Legacy drafts have no observation dates. */ }
+  return {};
+}
+export function expireDailyValues(input: Partial<FormState>, date = input.date ?? "", strict = false) {
+  const form = { ...emptyForm, ...input, date };
+  const dates = readFieldDates(form.fieldDates);
+  const expired: string[] = [];
+  const validDate = Number.isFinite(wallTime(`${date} 00:00`));
+  for (const key of dailyFields) {
+    const observed = dates[key] ?? (!strict && !form.fieldDates ? input.date : undefined);
+    if (!validDate || observed !== date) {
+      if (form[key] !== emptyForm[key]) expired.push(key);
+      Object.assign(form, { [key]: emptyForm[key] });
+      delete dates[key];
+    } else if (form[key] !== emptyForm[key]) dates[key] = date;
+  }
+  form.fieldDates = JSON.stringify(dates);
+  return { form, expired };
+}
+export function updateFormField<K extends keyof FormState>(input: Partial<FormState>, key: K, value: FormState[K]): FormState {
+  const { form } = expireDailyValues(input, key === "date" ? String(value) : input.date);
+  const dates = readFieldDates(form.fieldDates);
+  Object.assign(form, { [key]: value });
+  if (dailyFields.includes(key)) dates[key] = form.date;
+  if (key === "sleep3avg") { form.sleepDays3 = value === "" ? "" : "3"; dates.sleepDays3 = form.date; }
+  if (key === "preference" || key === "date") {
+    form.firstSetRir = ""; form.firstSetWeight = ""; form.firstSetExercise = "";
+  }
+  form.fieldDates = JSON.stringify(dates);
+  return form;
+}
+export function applyImportedData(current: Partial<FormState>, parsed: ParsedData, fullReport: boolean): FormState {
+  const date = parsed.values.date ?? current.date ?? today();
+  const base = fullReport ? { ...emptyForm, preference: current.preference ?? "auto", date } : expireDailyValues(current, date).form;
+  const form = { ...base, ...parsed.values, date };
+  const dates = fullReport ? {} as Record<string, string> : readFieldDates(base.fieldDates);
+  for (const key of dailyFields) if (Object.hasOwn(parsed.values, key)) dates[key] = date;
+  if (parsed.values.sleep3avg && !Object.hasOwn(parsed.values, "sleepDays3")) { form.sleepDays3 = "3"; dates.sleepDays3 = date; }
+  form.firstSetRir = ""; form.firstSetWeight = ""; form.firstSetExercise = "";
+  form.fieldDates = JSON.stringify(dates);
+  return form;
+}
 
 const numberOrNull = (value: string) => {
   if (value.trim() === "") return null;
@@ -83,10 +136,10 @@ const toneForScore = (score: number | null) => score === null ? "unknown" : scor
 const gaugeToneForScore = (score: number | null) => score === null ? "unknown" : score >= 90 ? "prime" : score >= 80 ? "high" : score >= 70 ? "moderate" : score >= 55 ? "low" : "poor";
 
 type StrengthGroup = "push" | "pull" | "legs" | "core";
-type StrengthHistoryItem = { name: string; canonicalName?: string; weight: number | null; unit: "kg" | "lbs" | "自重"; reps: number | null; sets: number; group: StrengthGroup; date: string; time: string; timestamp: number; sessionRpe: number | null; isWarmup?: boolean };
+type StrengthHistoryItem = { name: string; canonicalName?: string; weight: number | null; unit: "kg" | "lbs" | "自重"; reps: number | null; sets: number; group: StrengthGroup; date: string; time: string; timestamp: number; endTimestamp?: number; sessionRpe: number | null; isWarmup?: boolean };
 type ImportAudit = { evaluationAt: string; workouts: number; strengthSessions: number; excludedAfterEvaluation: number; exercises: StrengthHistoryItem[]; unparsed: string[] };
 type ParsedData = { values: Partial<FormState>; fields: string[]; audit?: ImportAudit };
-type PrescribedExercise = { name: string; prescription: string; rpe: string; rir: string; rest: string; source: string; progression: string };
+type PrescribedExercise = { name: string; prescription: string; rpe: string; rir: string; rest: string; source: string; progression: string; calibrationId: string; unit: string; initialWeight: number | null };
 
 function canonicalExerciseName(value: string) {
   const name = value.replace(/[【】*]/g, "").replace(/（[^）]*）|\([^)]*\)/g, "").replace(/\s+/g, "").trim();
@@ -230,17 +283,24 @@ function parseFullExport(source: string): ParsedData | null {
 
   const sleepBlock = section("Sleep Session Detail:", ["Average HRV Value During Sleep Session:"]);
   const sleepPattern = /(20\d{2})年(\d{1,2})月(\d{1,2})日\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*-\s*(20\d{2})年(\d{1,2})月(\d{1,2})日\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*\nTotal:\s*([^\n]+)\nCore:\s*([^\n]+)\nDeep:\s*([^\n]+)\nREM:\s*([^\n]+)\nWakeUp:\s*([^\n]+)/g;
-  const sleepSessions = [...sleepBlock.matchAll(sleepPattern)].map(match => {
+  const sleepCandidates = [...sleepBlock.matchAll(sleepPattern)].map(match => {
     const endDate = `${match[7]}-${match[8].padStart(2, "0")}-${match[9].padStart(2, "0")}`;
     const endTime = `${match[10].padStart(2, "0")}:${match[11].padStart(2, "0")}`;
+    const stages = [match[14], match[15], match[16]].map(parseDuration);
     return {
       endDate,
       endTime,
-      timestamp: Date.UTC(Number(match[7]), Number(match[8]) - 1, Number(match[9]), Number(match[10]), Number(match[11]), Number(match[12] ?? 0)),
+      start: wallTime(`${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")} ${match[4].padStart(2, "0")}:${match[5].padStart(2, "0")}:${match[6] ?? "00"}`),
+      timestamp: wallTime(`${endDate} ${endTime}:${match[12] ?? "00"}`),
       timeInBed: parseDuration(match[13]),
-      sleep: [match[14], match[15], match[16]].map(parseDuration).reduce<number>((sum, item) => sum + (item ?? 0), 0),
+      sleep: stages.every(value => value !== null && value >= 0) ? stages.reduce<number>((sum, value) => sum + (value ?? 0), 0) : NaN,
     };
-  }).sort((a, b) => b.timestamp - a.timestamp);
+  }).filter(session => Number.isFinite(session.start) && Number.isFinite(session.timestamp) && Number.isFinite(session.sleep)
+    && session.timestamp > session.start && session.sleep <= (session.timestamp - session.start) / 3_600_000 + .05
+    && (session.timeInBed === null || session.sleep <= session.timeInBed + .05)).sort((a, b) => b.sleep - a.sleep);
+  const sleepSessions: typeof sleepCandidates = [];
+  // Keep one record for overlapping device exports, and add nonoverlapping naps by day.
+  for (const session of sleepCandidates) if (!sleepSessions.some(other => session.start < other.timestamp && session.timestamp > other.start)) sleepSessions.push(session);
   const latestSleep = sleepSessions.filter(session => session.endDate === latestDate).sort((a, b) => b.sleep - a.sleep)[0];
   const evaluationTimestamp = latestSleep?.timestamp ?? dayStamp(latestDate) + 9 * 3_600_000;
   const evaluationAt = latestSleep ? `${latestSleep.endDate} ${latestSleep.endTime}` : `${latestDate} 09:00`;
@@ -249,22 +309,27 @@ function parseFullExport(source: string): ParsedData | null {
     save("sleep", "实际睡眠", rounded(latestSleep.sleep));
     save("timeInBed", "卧床时间", latestSleep.timeInBed === null ? null : rounded(latestSleep.timeInBed));
   }
-  const recentSleep = sleepSessions.filter(session => {
+  const sleepByDay = new Map<string, number>();
+  for (const session of sleepSessions) {
     const age = (dayStamp(latestDate) - dayStamp(session.endDate)) / 86_400_000;
-    return age >= 0 && age < 3;
-  }).map(session => session.sleep);
-  if (recentSleep.length) save("sleep3avg", "近3日平均睡眠", rounded(mean(recentSleep)!));
+    if (age >= 0 && age < 3 && session.timestamp <= evaluationTimestamp) sleepByDay.set(session.endDate, (sleepByDay.get(session.endDate) ?? 0) + session.sleep);
+  }
+  save("sleepDays3", "近3日睡眠有效天数", String(sleepByDay.size));
+  if (sleepByDay.size === 3) save("sleep3avg", "近3日平均睡眠（按天含午睡）", rounded(mean([...sleepByDay.values()])!));
 
   const workoutBlock = section("Workout list, each line is an entry of workout", ["ATL(Fatigue)"]);
   type ParsedWorkout = { date: string; time: string; timestamp: number; type: string; duration: number; rpe: number | null; detail: string };
   const workouts: ParsedWorkout[] = [];
   const cyclingSessions: CyclingSession[] = [];
+  const activitySessions: ActivitySession[] = [];
   let cyclingParseIncomplete = false;
+  let activityParseIncomplete = false;
   const workoutEntries = workoutBlock.match(/^Type:[\s\S]*?(?=^Type:|(?![\s\S]))/gim) ?? [];
   for (const entry of workoutEntries) {
     const match = /^Type:\s*([^,\n]+),\s*Date:\s*(\d{2}-\d{2})\s+(\d{2}):(\d{2}),\s*Duration:\s*(\d+(?:\.\d+)?)\s*mins\b/im.exec(entry);
     if (!match) {
       if (isCycling(/^Type:\s*([^,\n]+)/i.exec(entry)?.[1] ?? "")) cyclingParseIncomplete = true;
+      activityParseIncomplete = true;
       continue;
     }
     const date = expandMonthDay(match[2]);
@@ -272,6 +337,7 @@ function parseFullExport(source: string): ParsedData | null {
     const timestamp = wallTime(`${date} ${time}`);
     if (!Number.isFinite(timestamp) || Number(match[5]) <= 0) {
       if (isCycling(match[1])) cyclingParseIncomplete = true;
+      activityParseIncomplete = true;
       continue;
     }
     const detail = /Workout Tag:\s*([\s\S]*)/i.exec(entry)?.[1].trim() ?? "";
@@ -282,11 +348,19 @@ function parseFullExport(source: string): ParsedData | null {
     workouts.push(workout);
     const cycling = parseCyclingSession(workout, entry);
     if (cycling && cycling.end <= evaluationTimestamp && evaluationTimestamp - cycling.end < 7 * 86_400_000) cyclingSessions.push(cycling);
+    const end = timestamp + workout.duration * 60_000;
+    if (activityGroups(workout.type).length && end <= evaluationTimestamp && evaluationTimestamp - end < 7 * 86_400_000)
+      activitySessions.push({ type: workout.type, start: timestamp, end, duration: workout.duration, rpe, detail });
   }
   const eligibleWorkouts = workouts.filter(workout => workout.timestamp + workout.duration * 60_000 <= evaluationTimestamp);
+  const workoutFilter = /^Workout Filter:\s*([^\n]+)/im.exec(source)?.[1] ?? "所有运动";
+  const filteredExport = !/所有|全部|all/i.test(workoutFilter);
+  save("activityHistory", "其他专项活动与局部负荷", JSON.stringify(activitySessions));
+  save("activityAsOf", "局部负荷评估时点", evaluationAt);
+  if (activityParseIncomplete || filteredExport) { values.activityAsOf = ""; fields.push("运动记录不完整，请导出所有运动并核对记录格式"); }
   save("cyclingHistory", "骑行时长、强度区间与结束时点", JSON.stringify(cyclingSessions));
   save("cyclingAsOf", "骑行评估时点", evaluationAt);
-  if (cyclingParseIncomplete) {
+  if (cyclingParseIncomplete || filteredExport) {
     values.cyclingAsOf = "";
     fields.push("骑行记录有未识别项，请核对时间与时长");
   }
@@ -303,7 +377,7 @@ function parseFullExport(source: string): ParsedData | null {
     save("workoutMinutes", "7日训练时长", rounded(totalMinutes, 0));
     if (allRpeKnown) save("workoutLoad", "7日训练负荷", rounded(totalLoad));
     save("strengthFrequency", "Strength Frequency", rounded(recentWorkouts.filter(workout => workout.type.includes("力量")).length, 0));
-    save("aerobicMinutes7", "7日有氧与专项时长", rounded(recentWorkouts.filter(workout => isCycling(workout.type) || /游泳|划船|爬楼梯|椭圆机|步行|拳击|高强度间歇/.test(workout.type)).reduce((sum, workout) => sum + workout.duration, 0), 0));
+    save("aerobicMinutes7", "7日有氧与专项时长", rounded(recentWorkouts.filter(workout => isAerobicActivity(workout.type)).reduce((sum, workout) => sum + workout.duration, 0), 0));
     save("density", "Density", rounded(recentWorkouts.length / 7));
     const dailyLoads = Array.from({ length: 7 }, (_, index) => recentWorkouts
       .filter(workout => dayStamp(workout.date) === dayStamp(latestDate) - (index + 1) * 86_400_000)
@@ -386,6 +460,7 @@ function parseFullExport(source: string): ParsedData | null {
         date: workout.date,
         time: workout.time,
         timestamp: workout.timestamp,
+        endTimestamp: workout.timestamp + workout.duration * 60_000,
         sessionRpe: workout.rpe,
       });
     }
@@ -393,13 +468,14 @@ function parseFullExport(source: string): ParsedData | null {
     for (const name of candidateNames) if (![...sessionItems.values()].some(item => item.name === name)) unparsedStrengthLines.push(`${workout.date} ${name}`);
   }
   strengthHistory.sort((a, b) => b.timestamp - a.timestamp);
-  const strength48 = eligibleWorkouts.filter(workout => workout.type.includes("力量") && evaluationTimestamp - workout.timestamp >= 0 && evaluationTimestamp - workout.timestamp <= 48 * 3_600_000);
+  const strength48 = eligibleWorkouts.filter(workout => workout.type.includes("力量") && evaluationTimestamp - (workout.timestamp + workout.duration * 60_000) <= 48 * 3_600_000);
   const pushSets48 = strength48.reduce((sum, workout) => sum + countSets(workout.detail, "push"), 0);
   const pullSets48 = strength48.reduce((sum, workout) => sum + countSets(workout.detail, "pull"), 0);
   const legsSets48 = strength48.reduce((sum, workout) => sum + countSets(workout.detail, "legs"), 0);
-  const pushSets7 = recentWorkouts.reduce((sum, workout) => sum + countSets(workout.detail, "push"), 0);
-  const pullSets7 = recentWorkouts.reduce((sum, workout) => sum + countSets(workout.detail, "pull"), 0);
-  const legsSets7 = recentWorkouts.reduce((sum, workout) => sum + countSets(workout.detail, "legs"), 0);
+  const recentStrength = recentWorkouts.filter(workout => workout.type.includes("力量"));
+  const pushSets7 = recentStrength.reduce((sum, workout) => sum + countSets(workout.detail, "push"), 0);
+  const pullSets7 = recentStrength.reduce((sum, workout) => sum + countSets(workout.detail, "pull"), 0);
+  const legsSets7 = recentStrength.reduce((sum, workout) => sum + countSets(workout.detail, "legs"), 0);
   const upperSets48 = pushSets48 + pullSets48;
   const lowerSets48 = legsSets48;
   save("upperSets48", "48小时上肢正式组", rounded(upperSets48, 0));
@@ -583,9 +659,9 @@ export function parsePastedData(source: string): ParsedData {
   }
   const neuralLine = lineValue([/^(?:Neural Readiness|Neural Ready|Neural|CNS Fatigue)\s*[:=]?\s*([^\n]+)/im]);
   if (neuralLine) {
-    if (/fatigue|yes|high|是|疲劳/i.test(neuralLine)) save("neural", "Neural / CNS", "fatigue");
-    else if (/limited|受限/i.test(neuralLine)) save("neural", "Neural / CNS", "limited");
-    else if (/normal|ready|no|正常|否/i.test(neuralLine)) save("neural", "Neural / CNS", "normal");
+    if (/fatigue|yes|high|是|疲劳/i.test(neuralLine)) save("neural", "主观恢复受限（旧标签兼容）", "fatigue");
+    else if (/limited|受限/i.test(neuralLine)) save("neural", "主观恢复受限", "limited");
+    else if (/normal|ready|no|正常|否/i.test(neuralLine)) save("neural", "主观恢复状态", "normal");
   }
   const symptomLine = lineValue([/^(?:疾病症状|急性症状|Illness|Symptoms?)\s*[:=]\s*([^\n]+)/im]);
   if (symptomLine) {
@@ -674,7 +750,8 @@ function SegmentMeter({ value }: { value: number | null }) {
 }
 
 export function evaluateReadiness(input: Partial<FormState>) {
-    const form = { ...emptyForm, ...input };
+    const { form, expired } = expireDailyValues(input);
+    const evaluationTimestamp = assessmentTime(form.date, form.evaluationAt);
     const hrv = numberOrNull(form.hrv), hrvBaseline = numberOrNull(form.hrvBaseline);
     const hrv3d = numberOrNull(form.hrv3d), hrv7avg = numberOrNull(form.hrv7avg), hrv7sd = numberOrNull(form.hrv7sd);
     const sleep = numberOrNull(form.sleep), timeInBed = numberOrNull(form.timeInBed);
@@ -690,12 +767,15 @@ export function evaluateReadiness(input: Partial<FormState>) {
     let strengthHistory: StrengthHistoryItem[] = [];
     try {
       const savedHistory = form.strengthHistory ? JSON.parse(form.strengthHistory) as Array<StrengthHistoryItem & { region?: "upper" | "lower" }> : [];
-      strengthHistory = savedHistory.map(item => ({ ...item, canonicalName: item.canonicalName ?? canonicalExerciseName(item.name), group: item.group ?? (item.region === "lower" ? "legs" : /卧推|推胸|推举|下压|臂屈伸/.test(item.name) ? "push" : "pull"), time: item.time ?? "00:00", timestamp: item.timestamp ?? Date.parse(`${item.date}T00:00:00Z`), sessionRpe: item.sessionRpe ?? 6, isWarmup: item.isWarmup ?? false }));
+      strengthHistory = savedHistory.map(item => ({ ...item, canonicalName: item.canonicalName ?? canonicalExerciseName(item.name), group: item.group ?? (item.region === "lower" ? "legs" : /卧推|推胸|推举|下压|臂屈伸/.test(item.name) ? "push" : "pull"), time: item.time ?? "00:00", timestamp: item.timestamp ?? Date.parse(`${item.date}T00:00:00Z`), sessionRpe: item.sessionRpe ?? null, isWarmup: item.isWarmup ?? false }))
+        .filter(item => (item.endTimestamp ?? item.timestamp) <= evaluationTimestamp).sort((a, b) => b.timestamp - a.timestamp);
     } catch { strengthHistory = []; }
     const pain = numberOrNull(form.pain);
     const energy = numberOrNull(form.energy), fatigue = numberOrNull(form.fatigue), motivation = numberOrNull(form.motivation), stress = numberOrNull(form.stress);
     const upperSoreness = numberOrNull(form.upperSoreness), lowerSoreness = numberOrNull(form.lowerSoreness), sleepQuality = numberOrNull(form.sleepQuality);
     const sleep3avg = numberOrNull(form.sleep3avg), warmupRpeDelta = numberOrNull(form.warmupRpeDelta), warmupPain = numberOrNull(form.warmupPain), firstSetRir = numberOrNull(form.firstSetRir);
+    const firstSetWeight = numberOrNull(form.firstSetWeight);
+    const sleepDays3 = numberOrNull(form.sleepDays3) ?? (sleep3avg === null ? 0 : 3);
 
     const hrvRatio = hrv !== null && hrvBaseline ? hrv / hrvBaseline : null;
     const hrvZ = hrv !== null && hrv7avg !== null && hrv7sd ? (hrv - hrv7avg) / hrv7sd : null;
@@ -709,11 +789,15 @@ export function evaluateReadiness(input: Partial<FormState>) {
     const sleepEfficiency = sleep !== null && timeInBed ? Math.min(100, sleep / timeInBed * 100) : null;
     const sleepDurationScore = sleep === null ? null : scoreSleepHours(sleep);
     const sleepEfficiencyScore = sleepEfficiency === null ? null : scoreEfficiency(sleepEfficiency);
-    const sleepScore = weighted([
+    const sleepBaseScore = weighted([
       ...(sleepDurationScore === null ? [] : [{ value: sleepDurationScore, weight: .8 }]),
       ...(sleepEfficiencyScore === null ? [] : [{ value: sleepEfficiencyScore, weight: .2 }]),
     ]);
-    const sleepDebt3d = sleep3avg === null ? null : Math.max(0, (DAILY_SLEEP_NEED_HOURS - sleep3avg) * 3);
+    const sleepDebt3d = sleep3avg === null || sleepDays3 < 3 ? null : Math.max(0, (DAILY_SLEEP_NEED_HOURS - sleep3avg) * 3);
+    // Charge cumulative sleep debt once, inside the sleep component. Caps below
+    // are scheduling ceilings, not additional point deductions or medical cutoffs.
+    const sleepDebtPenalty = sleepDebt3d === null ? 0 : Math.min(20, sleepDebt3d * 3);
+    const sleepScore = sleepBaseScore === null ? null : Math.max(0, sleepBaseScore - sleepDebtPenalty);
     const rhrDelta = rhr !== null && rhrBaseline !== null ? rhr - rhrBaseline : null;
     const rhrScore = rhrDelta === null ? null : scoreRhr(rhrDelta);
     const recoveryParts = [hrvScore, sleepScore, rhrScore].filter(value => value !== null).length;
@@ -759,8 +843,9 @@ export function evaluateReadiness(input: Partial<FormState>) {
       readiness = Math.max(0, Math.min(100, readiness + Math.max(-10, Math.min(8, (subjectiveScore - 70) * .25))));
     }
     const limits: string[] = [];
-    const neuralTriggers = [hrvRatio !== null && hrvRatio < .9, hrvZ !== null && hrvZ < -1, rhrDelta !== null && rhrDelta >= 3].filter(Boolean).length;
-    const neuralKnownInputs = [hrvRatio !== null, hrvZ !== null, rhrDelta !== null].filter(Boolean).length;
+    const hrvSignalAbnormal = (hrvRatio !== null && hrvRatio < .9) || (hrvZ !== null && hrvZ < -1);
+    const neuralTriggers = [hrvSignalAbnormal, rhrDelta !== null && rhrDelta >= 3].filter(Boolean).length;
+    const neuralKnownInputs = [hrvRatio !== null || hrvZ !== null, rhrDelta !== null].filter(Boolean).length;
     const neuralStatus: "ready" | "limited" | "unknown" = form.neural === "limited" || form.neural === "fatigue" || neuralTriggers > 0
       ? "limited"
       : form.neural === "normal" || (hrvRatio !== null && rhrDelta !== null && hrvRatio >= .9 && rhrDelta <= 2 && (hrvZ === null || hrvZ >= -1))
@@ -769,43 +854,68 @@ export function evaluateReadiness(input: Partial<FormState>) {
     const neuralLimited = neuralStatus === "limited";
     const neuralReady = neuralStatus === "ready";
     const neuralPressure = neuralTriggers >= 2 ? "High" : neuralTriggers === 1 ? "Moderate" : neuralKnownInputs >= 2 ? "Low" : "Unknown";
-    const cnsFatigue = neuralTriggers >= 2 ? "Yes" : neuralKnownInputs === 3 ? "No" : "Unknown";
+    if (readiness !== null && sleepDebt3d !== null && sleepDebt3d >= 3) {
+      readiness = Math.min(readiness, sleepDebt3d >= 6 ? 69.99 : 79.99);
+      limits.push(`3日睡眠债${sleepDebt3d.toFixed(1)}小时：今日最高${sleepDebt3d >= 6 ? "轻量技术/恢复" : "降量训练"}，按每日7.5小时计算`);
+    }
     if (readiness !== null && (form.symptoms === "acute" || (pain !== null && pain > 3))) {
       readiness = Math.min(readiness, 69.99); limits.push("疼痛＞3/10或明显症状：训练准备度最高 Level 2");
     }
     if (readiness !== null && neuralLimited) {
-      readiness = Math.min(readiness, 79.99); limits.push("Neural Limited：最高 Level 3，禁止极限力量、冲刺、HIIT和高强度拳击");
+      readiness = Math.min(readiness, 79.99); limits.push("自主神经恢复信号异常或主观受限：最高 Level 3，不安排极限力量、冲刺、HIIT和高强度拳击");
     }
-    const evaluationTimestamp = assessmentTime(form.date, form.evaluationAt);
     const cycling = assessCycling(cyclingHistory, evaluationTimestamp, { kind: form.cyclingManualKind, end: wallTime(form.cyclingManualEnd) });
+    const activity = assessActivityLoad(readActivityHistory(form.activityHistory), evaluationTimestamp);
+    const activityUncertain = activity.incomplete || form.activityAsOf.slice(0, 10) !== form.date;
+    const mixedLegSessions = [...cycling.sessions, ...activity.sessions.filter(session => session.groups.includes("legs"))]
+      .filter(session => session.ageHours < 48).sort((a, b) => b.end - a.end);
+    const legLoad48 = mixedLegSessions.reduce((sum, session) => sum + (session.load ?? 0), 0);
+    const latestLegLoad = mixedLegSessions.find(session => session.ageHours < 24 && (session.load ?? 0) >= 150);
+    const mixedLegBlock = legLoad48 >= 900 && latestLegLoad !== undefined;
+    const mixedLegRemainingHours = mixedLegBlock ? (latestLegLoad.end + 24 * 3_600_000 - evaluationTimestamp) / 3_600_000 : 0;
     const cyclingStale = form.cyclingAsOf.slice(0, 10) !== form.date;
     const legsSore = lowerSoreness !== null && lowerSoreness >= 4;
+    const upperSore = upperSoreness !== null && upperSoreness >= 4;
     const legsChecked = lowerSoreness !== null && lowerSoreness <= 2 && form.fatigueLegs === "no";
     const legWarmupCleared = legsChecked && warmupRpeDelta !== null && warmupRpeDelta < 2 && warmupPain !== null && warmupPain <= 3
       && form.movementQuality === "normal" && form.warmupHr !== "high" && form.warmupEnergy !== "worse";
+    const upperWarmupCleared = upperSoreness !== null && upperSoreness <= 2 && warmupRpeDelta !== null && warmupRpeDelta < 2
+      && warmupPain !== null && warmupPain <= 3 && form.movementQuality === "normal" && form.warmupHr !== "high" && form.warmupEnergy !== "worse";
+    const activityBlocks = {
+      push: activity.groups.push.blocked || (activity.groups.push.reassess || activity.groups.push.unknown) && !(upperWarmupCleared && form.fatiguePush === "no"),
+      pull: activity.groups.pull.blocked || (activity.groups.pull.reassess || activity.groups.pull.unknown) && !(upperWarmupCleared && form.fatiguePull === "no"),
+      legs: activity.groups.legs.blocked || mixedLegBlock || (activity.groups.legs.reassess || activity.groups.legs.unknown) && !legWarmupCleared,
+    };
     const cyclingRecheck = cycling.reassess && !legWarmupCleared;
     const manualCyclingInvalid = form.cyclingManualKind !== "none" && (!Number.isFinite(wallTime(form.cyclingManualEnd)) || wallTime(form.cyclingManualEnd) > evaluationTimestamp);
     const cyclingUncertain = cycling.incomplete || cyclingStale || manualCyclingInvalid || !Number.isFinite(evaluationTimestamp);
     const cyclingLegBlock = cycling.blocked || legacyCyclingBlock || cyclingRecheck || manualCyclingInvalid || cyclingUncertain && !legWarmupCleared;
-    const recentStrengthExposure = (group: StrengthGroup, hours: number) => strengthHistory.some(item => !item.isWarmup && item.group === group && evaluationTimestamp - item.timestamp >= 0 && evaluationTimestamp - item.timestamp <= hours * 3_600_000);
+    const recentStrengthExposure = (group: StrengthGroup, hours: number) => strengthHistory.some(item => !item.isWarmup && item.group === group && evaluationTimestamp - (item.endTimestamp ?? item.timestamp) >= 0 && evaluationTimestamp - (item.endTimestamp ?? item.timestamp) <= hours * 3_600_000);
     const pushCooldown = pushSets48 > 0 || recentStrengthExposure("push", 48);
     const pullCooldown = pullSets48 > 0 || recentStrengthExposure("pull", 48);
     const legsCooldown = legsSets48 > 0 || recentStrengthExposure("legs", 48);
     const legsStrength36 = recentStrengthExposure("legs", 36);
-    const pushFatigued = pushSets48 >= 8 || form.fatiguePush === "yes";
-    const pullFatigued = pullSets48 >= 8 || form.fatiguePull === "yes";
-    const legsFatigued = legsSets48 >= 8 || form.fatigueLegs === "yes" || cyclingLegBlock || legsSore;
+    const pushFatigued = pushSets48 >= 8 || form.fatiguePush === "yes" || upperSore || activityBlocks.push;
+    const pullFatigued = pullSets48 >= 8 || form.fatiguePull === "yes" || upperSore || activityBlocks.pull;
+    const legsFatigued = legsSets48 >= 8 || form.fatigueLegs === "yes" || cyclingLegBlock || legsSore || activityBlocks.legs;
     const fatiguedLabels = [pushFatigued ? "推" : "", pullFatigued ? "拉" : "", legsFatigued ? "腿" : ""].filter(Boolean);
     if (cycling.blocked) limits.push(`${cycling.reason}；窗口剩余约${Math.ceil(cycling.remainingHours)}小时，之后复查体感与热身`);
     if (cyclingRecheck) limits.push("强骑已满48小时但尚未通过腿部体感与热身复查：暂缓腿力量和强骑");
     if (legacyCyclingBlock) limits.push("旧版记录显示近期强骑，但缺少结束时点：先保留腿部限制，请重新导入原始报告");
     if (cyclingUncertain && !legWarmupCleared && !cycling.blocked && !legacyCyclingBlock) limits.push("骑行资料不足：补齐骑行记录或通过腿部体感与热身检查后，再安排腿力量");
     if (legsSore) limits.push("下肢酸痛≥4/5：不安排腿力量、节奏骑或冲刺；计时结束也不自动放行");
+    if (upperSore) limits.push("上肢酸痛≥4/5：不安排推拉力量、游泳或拳击，改选无冲突项目");
+    if (mixedLegBlock) limits.push(`骑行与其他腿部活动48小时已知负荷合计${legLoad48.toFixed(0)} AU：最近一次主要活动结束后24小时暂缓腿力量和强骑`);
+    for (const group of ["push", "pull", "legs"] as const) {
+      const label = { push: "推", pull: "拉", legs: "腿" }[group];
+      if (activity.groups[group].blocked) limits.push(`${label}部位恢复限制：${activity.groups[group].reason}；剩余约${Math.ceil(activity.groups[group].remainingHours)}小时`);
+      else if (activity.groups[group].reassess || activity.groups[group].unknown) limits.push(`${label}部位活动资料不足或强度活动需复查：先完成体感与热身检查`);
+    }
     if (fatiguedLabels.length) limits.push(`局部疲劳/恢复限制：${fatiguedLabels.join("＋")}；保留其他无冲突部位`);
     const cooldownLabels = [pushCooldown ? "推" : "", pullCooldown ? "拉" : "", legsCooldown ? "腿" : ""].filter(Boolean);
     if (cooldownLabels.length) limits.push(`同部位力量刺激未满48小时：${cooldownLabels.join("＋")}；今天不重复安排同部位`);
     if (legsStrength36) limits.push("腿部力量训练后36小时：骑行仅限轻松Zone 1–2，不安排节奏、阈值或冲刺");
-    const warmupComplete = warmupRpeDelta !== null || warmupPain !== null || form.warmupHr !== "unknown" || form.movementQuality !== "unknown" || form.warmupEnergy !== "unknown";
+    const warmupComplete = warmupRpeDelta !== null && warmupPain !== null && form.warmupHr !== "unknown" && form.movementQuality !== "unknown" && form.warmupEnergy !== "unknown";
     const warmupStop = (warmupPain !== null && warmupPain > 3) || form.movementQuality === "reduced";
     const warmupDowngrade = (warmupRpeDelta !== null && warmupRpeDelta >= 2) || form.warmupHr === "high" || form.warmupEnergy === "worse";
     if (readiness !== null && warmupStop) {
@@ -822,7 +932,7 @@ export function evaluateReadiness(input: Partial<FormState>) {
     const conflictPull = pullFatigued || pullCooldown;
     const conflictLegs = legsFatigued || legsCooldown;
     const cyclingCooldown = legsStrength36 || conflictLegs || lowerSoreness !== null && lowerSoreness >= 3;
-    const cyclingTempoAllowed = readinessLevel.level !== null && readinessLevel.level >= 4 && !cyclingCooldown && !cyclingUncertain
+    const cyclingTempoAllowed = readinessLevel.level !== null && readinessLevel.level >= 4 && !cyclingCooldown && !cyclingUncertain && !activityUncertain
       && !legsPainConflict && !neuralLimited && !warmupDowngrade && !warmupStop;
     const groupInfo = {
       push: { label: "推", weekly: pushSets7, conflict: conflictPush, pain: pushPainConflict },
@@ -830,12 +940,22 @@ export function evaluateReadiness(input: Partial<FormState>) {
       legs: { label: "腿", weekly: legsSets7, conflict: conflictLegs, pain: legsPainConflict },
     };
     const groupOrder = ["push", "pull", "legs"] as const;
+    const strengthScoreFor = (group: keyof typeof groupInfo) => {
+      if (readiness === null) return null;
+      const soreness = (group === "legs" ? lowerSoreness : upperSoreness) ?? 0;
+      const cap = groupInfo[group].conflict || groupInfo[group].pain ? 54 : soreness >= 3 || activityUncertain ? 79 : 100;
+      return Math.max(0, Math.min(cap, readiness - (soreness >= 4 ? 16 : soreness >= 3 ? 8 : 0)));
+    };
+    const strengthGroupScores = { push: strengthScoreFor("push"), pull: strengthScoreFor("pull"), legs: strengthScoreFor("legs") };
+    const strengthLevelFor = (group: keyof typeof groupInfo) => levelFor(strengthGroupScores[group]);
     const latestGroupTime = (group: keyof typeof groupInfo) => strengthHistory.find(item => item.group === group)?.timestamp ?? 0;
     const chooseStrengthTarget = () => groupOrder
-      .filter(group => !groupInfo[group].conflict && !groupInfo[group].pain)
+      .filter(group => !groupInfo[group].conflict && !groupInfo[group].pain && (strengthGroupScores[group] ?? 0) >= 55)
       .sort((a, b) => groupInfo[a].weekly - groupInfo[b].weekly || latestGroupTime(a) - latestGroupTime(b))[0] ?? null;
 
     const strengthPrescription = (group: keyof typeof groupInfo): PrescribedExercise[] => {
+      const level = strengthLevelFor(group).level ?? 1;
+      if (level < 2 || groupInfo[group].conflict || groupInfo[group].pain) return [];
       const blocked = (name: string) => pushPainConflict && /卧推|推胸|推举|侧平举|飞鸟|双杠|臂屈伸|下压/.test(name)
         || pullPainConflict && /划船|下拉|引体|弯举|飞鸟|面拉|农夫/.test(name)
         || legsPainConflict && /深蹲|硬拉|腿屈伸|保加利亚|箭步|台阶|静蹲|臀冲/.test(name)
@@ -847,41 +967,48 @@ export function evaluateReadiness(input: Partial<FormState>) {
         legs: [fallback("腿弯举", 10), fallback("臀冲", 8), fallback("哑铃台阶上步", 10), fallback("提踵", 15)],
       };
       const candidates = strengthHistory.filter((item, index, list) => item.group === group && !item.isWarmup && !blocked(item.name) && list.findIndex(other => other.group === group && !other.isWarmup && (other.canonicalName ?? canonicalExerciseName(other.name)) === (item.canonicalName ?? canonicalExerciseName(item.name))) === index);
-      const selected = [...candidates, ...fallbacks[group].filter(item => !candidates.some(candidate => (candidate.canonicalName ?? canonicalExerciseName(candidate.name)) === item.canonicalName) && !blocked(item.name))].slice(0, 4);
-      const targetRpe = readinessLevel.level !== null && readinessLevel.level >= 4 ? "6–7" : readinessLevel.level === 3 ? "5–6" : "3–4";
-      const targetRir = readinessLevel.level !== null && readinessLevel.level >= 4 ? "3–4" : readinessLevel.level === 3 ? "4–5" : "5+";
+      const selected = [...candidates, ...fallbacks[group].filter(item => !candidates.some(candidate => (candidate.canonicalName ?? canonicalExerciseName(candidate.name)) === item.canonicalName) && !blocked(item.name))].slice(0, level === 2 ? 2 : level === 3 ? 3 : 4);
+      const targetRpe = level >= 4 ? "6–7" : level === 3 ? "5–6" : "3–4";
+      const targetRir = level >= 4 ? "3–4" : level === 3 ? "4–5" : "5+";
       return selected.map((item, index) => {
         const canonicalName = item.canonicalName ?? canonicalExerciseName(item.name);
         const exposures = strengthHistory.filter(entry => !entry.isWarmup && (entry.canonicalName ?? canonicalExerciseName(entry.name)) === canonicalName && entry.unit === item.unit).slice(0, 3);
         const latest = exposures[0] ?? item;
         const reps = Math.max(6, Math.min(15, latest.reps ?? item.reps ?? 10));
-        const volumeSets = readinessLevel.level === 2 ? 2 : readinessLevel.level === 3 ? 3 : groupInfo[group].weekly >= 12 ? 2 : groupInfo[group].weekly < 8 && index === 0 ? 4 : 3;
+        const normalSets = groupInfo[group].weekly >= 12 ? 2 : groupInfo[group].weekly < 8 && index === 0 ? 4 : 3;
+        const volumeSets = level === 2 ? 2 : level === 3 ? Math.min(3, normalSets) : normalSets;
         const sets = Math.max(2, Math.min(4, volumeSets));
         const step = latest.unit === "lbs" ? 5 : group === "legs" ? 5 : 2.5;
+        const roundDown = (weight: number) => Number((Math.floor((weight + 1e-8) / step) * step || weight).toFixed(2));
         let targetWeight = latest.weight;
         let progression = exposures.length ? "先按最近正式重量完成首组，用动作级RIR校准；整节Session RPE不用于自动加重" : "无可靠历史重量：先用目标RPE/RIR建立工作重量";
-        if (latest.weight !== null && readinessLevel.level === 3) {
-          targetWeight = Math.max(step, Math.round(latest.weight * .9 / step) * step);
+        if (latest.weight !== null && level === 3) {
+          targetWeight = roundDown(latest.weight * .9);
           progression = "今日准备度Moderate：参考重量下调约10%";
-        } else if (latest.weight !== null && readinessLevel.level === 2) {
-          targetWeight = Math.max(step, Math.round(latest.weight * .7 / step) * step);
+        } else if (latest.weight !== null && level === 2) {
+          targetWeight = roundDown(latest.weight * .7);
           progression = "轻量技术日：参考重量下调约30%";
         }
-        if (index === 0 && latest.weight !== null && firstSetRir !== null) {
+        const initialWeight = targetWeight;
+        const calibrationId = `${form.date}:${group}:${canonicalName}:${latest.unit}`;
+        if (index === 0 && targetWeight !== null && firstSetRir !== null && firstSetRir >= 0 && firstSetRir <= 5 && form.firstSetExercise === calibrationId) {
+          const actualWeight = firstSetWeight !== null && firstSetWeight > 0 ? firstSetWeight : null;
+          const ceiling = level >= 4 ? initialWeight! + step : initialWeight!;
+          const baseWeight = Math.min(actualWeight ?? initialWeight!, initialWeight!);
           if (firstSetRir <= 2) {
-            targetWeight = Math.max(step, Math.round(latest.weight * .925 / step) * step);
-            progression = "首个正式组RIR≤2：后续组减重约5%–10%，不追加强度";
-          } else if (firstSetRir >= 4 && readinessLevel.level !== null && readinessLevel.level >= 4) {
-            targetWeight = latest.weight + step;
-            progression = `首个正式组RIR≥4且动作稳定：后续组可试加${step}${latest.unit}`;
+            targetWeight = roundDown(baseWeight * .925);
+            progression = "首组RIR≤2：从首组实际/今日推荐重量中较低者再减约5%–10%，不突破今日上限";
+          } else if (firstSetRir >= 4 && level >= 4 && actualWeight !== null && step <= actualWeight * .1 && form.movementQuality === "normal" && warmupPain === 0 && !warmupDowngrade) {
+            targetWeight = Math.min(ceiling, actualWeight + step);
+            progression = `首组RIR≥4且动作无痛稳定：最多试加${step}${latest.unit}，受今日上限约束`;
           } else {
-            targetWeight = readinessLevel.level === 3 ? Math.max(step, Math.round(latest.weight * .9 / step) * step) : latest.weight;
-            progression = "首个正式组RIR为3：后续组维持重量与动作质量";
+            targetWeight = baseWeight;
+            progression = "维持首组实际/今日推荐重量中较低者；降档日不因RIR较高恢复历史重量";
           }
         }
         const load = latest.unit === "自重" ? "自重" : targetWeight !== null ? `${targetWeight}${latest.unit}` : "按目标RPE选择重量";
-        const historyText = exposures.length ? exposures.map(entry => `${entry.date.slice(5)} ${entry.weight === null ? entry.unit : `${entry.weight}${entry.unit}`}×${entry.reps ?? "?"}（整节RPE${entry.sessionRpe}）`).join(" · ") : "无可靠历史重量，按RPE/RIR建立基准";
-        return { name: item.name, prescription: `${load} · ${sets}×${reps}`, rpe: targetRpe, rir: targetRir, rest: reps <= 8 ? "150秒" : "90–120秒", source: `近3次：${historyText}`, progression };
+        const historyText = exposures.length ? exposures.map(entry => `${entry.date.slice(5)} ${entry.weight === null ? entry.unit : `${entry.weight}${entry.unit}`}×${entry.reps ?? "?"}（整节RPE${entry.sessionRpe ?? "未知"}）`).join(" · ") : "无可靠历史重量，按RPE/RIR建立基准";
+        return { name: item.name, prescription: `${load} · ${sets}×${reps}`, rpe: targetRpe, rir: targetRir, rest: reps <= 8 ? "150秒" : "90–120秒", source: `近3次：${historyText}`, progression, calibrationId, unit: latest.unit, initialWeight };
       });
     };
 
@@ -892,7 +1019,7 @@ export function evaluateReadiness(input: Partial<FormState>) {
       if (readinessLevel.level === 1 || warmupStop) return { title: "主动恢复", detail: "步行、灵活性和呼吸练习；全程保持轻松，不追求训练量。", dose: "20–30 分钟｜RPE 1–2", exercises: empty, targetGroup: null };
       let target: FormState["preference"] = form.preference;
       if (target === "strength") target = chooseStrengthTarget() ?? "cycling";
-      if (target === "upper") target = ["push", "pull"].filter(group => !groupInfo[group as "push" | "pull"].conflict && !groupInfo[group as "push" | "pull"].pain).sort((a, b) => groupInfo[a as "push" | "pull"].weekly - groupInfo[b as "push" | "pull"].weekly)[0] as "push" | "pull" ?? "cycling";
+      if (target === "upper") target = ["push", "pull"].filter(group => !groupInfo[group as "push" | "pull"].conflict && !groupInfo[group as "push" | "pull"].pain && (strengthGroupScores[group as "push" | "pull"] ?? 0) >= 55).sort((a, b) => groupInfo[a as "push" | "pull"].weekly - groupInfo[b as "push" | "pull"].weekly)[0] as "push" | "pull" ?? "cycling";
       if (target === "lower") target = "legs";
       if (target === "auto") {
         const strengthTarget = chooseStrengthTarget();
@@ -900,22 +1027,29 @@ export function evaluateReadiness(input: Partial<FormState>) {
         target = strengthTarget && lowestStrengthDose <= 6 ? strengthTarget : aerobicMinutes7 < 120 ? "cycling" : strengthTarget ?? "cycling";
       }
       if ((target === "push" || target === "pull" || target === "legs") && (groupInfo[target].conflict || groupInfo[target].pain)) target = chooseStrengthTarget() ?? "cycling";
-      if (target === "boxing" && ((painActive && /肩|肘|腕/.test(form.painArea)) || neuralLimited)) target = "cycling";
+      if (target === "boxing" && (pushPainConflict || conflictPush || neuralLimited)) target = chooseStrengthTarget() ?? "cycling";
+      if (target === "swimming" && (pushPainConflict || pullPainConflict || conflictPush || conflictPull)) target = chooseStrengthTarget() ?? "cycling";
       if ((target === "cycling" || target === "boxing" || target === "swimming") && (legsPainConflict || legsSore)) {
         const upper = (["push", "pull"] as const).find(group => !groupInfo[group].conflict && !groupInfo[group].pain);
         if (upper) target = upper;
         else return { title: "休息与无痛轻活动", detail: "下肢疼痛或明显酸痛，且上肢也有冲突；不强行安排骑行、打腿或拳击步法。", dose: "按症状休息｜不追求训练量", exercises: empty, targetGroup: null };
       }
       if (target === "boxing" && cyclingCooldown) target = chooseStrengthTarget() ?? "cycling";
-      const moderate = readinessLevel.level === 3;
-      const lowTechnique = readinessLevel.level === 2;
-      const strengthPlan = (group: keyof typeof groupInfo) => ({
-        title: lowTechnique ? `轻量${groupInfo[group].label}技术训练` : `${groupInfo[group].label}力量训练`,
-        detail: `7日${groupInfo[group].label}训练${groupInfo[group].weekly}组；按最近3次正式记录调节重量，避开精确48小时疲劳与疼痛冲突。`,
-        dose: lowTechnique ? "25–35 分钟｜RPE 3–4" : moderate ? "40–50 分钟｜RPE 5–6" : "50–65 分钟｜RPE 6–7",
-        exercises: strengthPrescription(group), targetGroup: group,
-      });
-      if (lowTechnique && (target === "cycling" || target === "swimming" || target === "boxing")) return { title: "恢复骑行（可改休息）", detail: "仅在下肢无痛、越骑越轻松时进行；不安排节奏、阈值或冲刺。", dose: "15–30 分钟｜RPE 1–2", exercises: empty, targetGroup: null };
+      const sportLevel = levelFor(target === "cycling" ? cyclingScore : target === "swimming" ? swimmingScore : target === "boxing" ? boxingScore : readiness).level;
+      const moderate = sportLevel === 3;
+      const lowTechnique = sportLevel === 2;
+      const strengthPlan = (group: keyof typeof groupInfo) => {
+        const localLevel = strengthLevelFor(group).level;
+        return {
+          title: localLevel === 2 ? `轻量${groupInfo[group].label}技术训练` : localLevel === 3 ? `${groupInfo[group].label}力量训练（降量）` : `${groupInfo[group].label}力量训练`,
+          detail: `7日${groupInfo[group].label}训练${groupInfo[group].weekly}组；按${groupInfo[group].label}专项准备度${display(strengthGroupScores[group])}分决定重量和组数，避开局部恢复与疼痛冲突。`,
+          dose: localLevel === 2 ? "25–35 分钟｜RPE 3–4" : localLevel === 3 ? "40–50 分钟｜RPE 5–6" : "50–65 分钟｜RPE 6–7",
+          exercises: strengthPrescription(group), targetGroup: group,
+        };
+      };
+      if (lowTechnique && target === "cycling") return { title: "恢复骑行（可改休息）", detail: "仅在下肢无痛、越骑越轻松时进行；不安排节奏、阈值或冲刺。", dose: "15–30 分钟｜RPE 1–2", exercises: empty, targetGroup: null };
+      if (lowTechnique && target === "swimming") return { title: "轻松游泳技术", detail: "仅无痛轻松划水；不安排冲刺、强力打腿或高乳酸组。", dose: "20–30 分钟｜RPE 2–3", exercises: empty, targetGroup: null };
+      if (lowTechnique && target === "boxing") return { title: "轻量拳击技术", detail: "仅无痛轻松技术动作；不安排对抗、全力击打或高强度步法。", dose: "15–25 分钟｜RPE 2–3", exercises: empty, targetGroup: null };
       return {
         push: strengthPlan("push"), pull: strengthPlan("pull"), legs: strengthPlan("legs"),
         cycling: { title: cyclingTempoAllowed ? "骑行有氧质量课" : "低强度骑行 Zone 1–2", detail: cyclingCooldown ? "腿部仍有恢复限制：仅无痛轻松转腿，可直接休息；不安排节奏、阈值、冲刺或低踏频高阻力。" : !cyclingTempoAllowed ? "当前仅安排轻松有氧；强度记录不足或准备度受限时不加入节奏段。" : "稳定有氧为主，中段加入3×6分钟节奏段，组间轻松骑3分钟。", dose: cyclingCooldown ? "15–30 分钟｜RPE 1–2" : !cyclingTempoAllowed ? "30–45 分钟｜RPE 2–3" : "55–70 分钟｜RPE 5–6", exercises: empty, targetGroup: null },
@@ -936,32 +1070,23 @@ export function evaluateReadiness(input: Partial<FormState>) {
     const strengthFrequency = numberOrNull(form.strengthFrequency);
     const strengthFrequencyStatus = strengthFrequency === null ? "Unknown" : strengthFrequency <= 1 ? "频率偏低" : strengthFrequency <= 4 ? "合理" : strengthFrequency === 5 ? "偏高" : "过高";
     const fatigueStateLabel = (value: FormState["fatiguePush"]) => value === "yes" ? "疲劳" : value === "no" ? "可用" : "未知";
-    const fatigueSummary = `推${fatigueStateLabel(form.fatiguePush)} · 拉${fatigueStateLabel(form.fatiguePull)} · 腿${legsFatigued ? "受限" : fatigueStateLabel(form.fatigueLegs)}`;
+    const fatigueSummary = `推${pushFatigued ? "受限" : fatigueStateLabel(form.fatiguePush)} · 拉${pullFatigued ? "受限" : fatigueStateLabel(form.fatiguePull)} · 腿${legsFatigued ? "受限" : fatigueStateLabel(form.fatigueLegs)}`;
     const fatigueKnown = [form.fatiguePush, form.fatiguePull, form.fatigueLegs].filter(value => value !== "unknown").length;
     const fatigueScore = fatiguedLabels.length === 3 ? 40 : fatiguedLabels.length ? 70 : fatigueKnown === 3 ? 85 : null;
-    const strengthScoreFor = (group: keyof typeof groupInfo) => readiness === null ? null : Math.max(0, Math.min(group === "legs" && conflictLegs ? 54 : 100,
-      readiness
-      - (groupInfo[group].conflict ? 18 : 0)
-      - (groupInfo[group].pain ? (pain !== null && pain > 3 ? 30 : 12) : 0)
-      - (((group === "legs" ? lowerSoreness : upperSoreness) ?? 0) >= 4 ? 16 : ((group === "legs" ? lowerSoreness : upperSoreness) ?? 0) >= 3 ? 8 : 0)
-      - (neuralLimited ? 12 : 0)
-      - (warmupDowngrade ? 12 : 0)
-    ));
-    const strengthGroupScores = { push: strengthScoreFor("push"), pull: strengthScoreFor("pull"), legs: strengthScoreFor("legs") };
     const availableStrengthScores = groupOrder.filter(group => !groupInfo[group].pain && !groupInfo[group].conflict).map(group => strengthGroupScores[group]).filter((score): score is number => score !== null);
     const strengthScore = availableStrengthScores.length ? Math.max(...availableStrengthScores) : null;
     const aerobicScore = readiness === null ? null : Math.max(0, Math.min(100,
       readiness
-      - (neuralLimited ? 16 : 0)
       - (recovery !== null && recovery < 70 ? 10 : 0)
       - (form.symptoms === "acute" ? 28 : form.symptoms === "mild" ? 8 : 0)
-      - (warmupDowngrade ? 12 : 0)
     ));
     const strengthReadiness = strengthScore === null ? "Unavailable" : levelFor(strengthScore).label;
     const aerobicReadiness = aerobicScore === null ? "Unavailable" : levelFor(aerobicScore).label;
     // Keep systemic/aerobic recovery separate. This cap is a local scheduling
     // convention, not a second charge of cycling load against ATL/CTL.
-    const cyclingScore = aerobicScore === null ? null : Math.max(0, Math.min(cyclingCooldown || legsPainConflict ? 54 : cyclingUncertain ? 69 : 100, aerobicScore));
+    const cyclingScore = aerobicScore === null ? null : Math.max(0, Math.min(cyclingCooldown || legsPainConflict ? 54 : cyclingUncertain || activityUncertain ? 69 : 100, aerobicScore));
+    const swimmingScore = aerobicScore === null ? null : Math.min(aerobicScore, strengthGroupScores.push ?? 100, strengthGroupScores.pull ?? 100, cyclingCooldown ? 69 : 100);
+    const boxingScore = aerobicScore === null ? null : Math.min(aerobicScore, strengthGroupScores.push ?? 100, strengthGroupScores.legs ?? 100);
     const positives: string[] = [];
     if (sleepScore !== null && sleepScore >= 80) positives.push(`睡眠 ${sleep?.toFixed(2)}h，效率 ${sleepEfficiency?.toFixed(2)}%`);
     if (formScore !== null && formScore >= 80) positives.push(`Form ${formValue?.toFixed(2)}，疲劳已充分释放`);
@@ -972,42 +1097,55 @@ export function evaluateReadiness(input: Partial<FormState>) {
     if (pain === null) limitations.push("今日疼痛未填写，建议性质为有条件成立");
     if (form.symptoms === "unknown") limitations.push("疾病症状未填写，不能默认正常");
     if (subjectiveScore !== null && subjectiveScore < 55) limitations.push(`主观状态偏低：晨检 ${subjectiveScore.toFixed(0)}/100`);
-    const suggestionType = subjectiveMissing || neuralStatus === "unknown" || cyclingUncertain ? "有条件成立" : "确定";
-    const decision = readinessLevel.level === null ? "等待数据" : readinessLevel.level >= 4 ? "正常训练" : readinessLevel.level === 3 ? "降量训练" : readinessLevel.level === 2 ? "恢复训练" : "完全休息";
+    const suggestionType = subjectiveMissing || neuralStatus === "unknown" || cyclingUncertain || activityUncertain || sleepDays3 < 3 ? "有条件成立" : "确定";
     const uniqueLimitations = [...new Set(limitations)];
     const actionState = readinessLevel.level === null ? "WAIT" : readinessLevel.level >= 4 ? "TRAIN" : readinessLevel.level === 3 ? "MODIFY" : "RECOVER";
     const keyLimiter = uniqueLimitations[0] ?? (fatiguedLabels.length ? `48h 局部力量疲劳：${fatiguedLabels.join("＋")}` : "暂无显著限制因素");
     const dataWarnings: string[] = [];
+    if (expired.length) dataWarnings.push(`${expired.length}项读数不属于当前评估日期，已退出评分；请重新导入或填写`);
+    if (sleepDays3 < 3) dataWarnings.push(`近3日睡眠仅有${sleepDays3}天有效记录：睡眠债保持未知，不用缺失天数代替零睡眠`);
     if (sleep !== null && timeInBed !== null && sleep > timeInBed + .05) dataWarnings.push("睡眠时长大于卧床时间，请检查原始数据");
     if (pain !== null && (pain < 0 || pain > 10)) dataWarnings.push("疼痛评分应在 0–10 之间");
     if (atl !== null && atl < 0 || ctl !== null && ctl < 0) dataWarnings.push("ATL / CTL 不应为负值");
-    if (neuralStatus === "unknown") dataWarnings.push("神经状态资料不足：保留 Unknown，不扣分也不封顶");
+    if (neuralStatus === "unknown") dataWarnings.push("自主神经恢复资料不足：保留未知，不据此推断中枢疲劳");
+    if (activityUncertain) dataWarnings.push("其他专项活动记录不完整或不是今日导入：局部负荷仅展示已知部分，准备度与处方保守处理");
     if (cyclingUncertain) dataWarnings.push("骑行强度记录不完整或不是今日导入：请重贴原始报告；不把缺失记录当作腿已恢复");
     if (cycling.missingRpe) dataWarnings.push(`${cycling.missingRpe}次骑行缺少RPE：骑行负荷只展示已知部分，不用0代替缺失值`);
     if (manualCyclingInvalid) dataWarnings.push("补充骑行的结束时间缺失或晚于评估时点，尚未计入；请修正时间");
     const chosenPlan = choosePlan();
     const localRecoveryPlan = chosenPlan.title.includes("骑行") && cyclingCooldown;
+    const selectedScore = chosenPlan.targetGroup ? strengthGroupScores[chosenPlan.targetGroup] : chosenPlan.title.includes("骑行") ? cyclingScore : chosenPlan.title.includes("游泳") ? swimmingScore : chosenPlan.title.includes("拳击") ? boxingScore : readiness;
+    const selectedLevel = levelFor(selectedScore).level;
+    const selectedDecision = readiness === null ? "等待数据" : /休息|主动恢复/.test(chosenPlan.title) ? "恢复或休息" : selectedLevel !== null && selectedLevel >= 4 ? "正常训练" : selectedLevel === 3 ? "降量训练" : "恢复训练";
     const preferenceLabels: Record<FormState["preference"], string> = { auto: "按规则推荐", strength: "力量优先", push: "推力量", pull: "拉力量", legs: "腿力量", upper: "上肢力量", lower: "下肢力量", cycling: "有氧优先", swimming: "游泳", boxing: "拳击" };
     const recommendationReason = form.preference !== "auto"
-      ? `已优先考虑「${preferenceLabels[form.preference]}」；疼痛、疾病症状、神经限制和48小时局部疲劳仍可自动改写项目。`
+      ? `已优先考虑「${preferenceLabels[form.preference]}」；疼痛、症状、自主神经恢复信号与各运动局部疲劳仍可改写项目和剂量。`
       : chosenPlan.targetGroup
         ? `自动选择${groupInfo[chosenPlan.targetGroup].label}力量：该部位7日有效训练量为${groupInfo[chosenPlan.targetGroup].weekly}组，且当前没有明确疼痛或48小时疲劳冲突。`
         : chosenPlan.title.includes("骑行")
           ? `自动比较恢复、专项准备度与7日训练结构后选择骑行；当前记录的7日有氧/专项剂量为${aerobicMinutes7}分钟。`
           : `根据今日恢复、专项准备度、疼痛与局部疲劳，选择当前冲突最少的项目。`;
-    const recoveryConfidence = recoveryInputs === 3 && sleep3avg !== null ? "高" : recoveryInputs >= 2 ? "中" : "低";
-    const strengthConfidence = recovery !== null && pain !== null && upperSoreness !== null && lowerSoreness !== null && [form.fatiguePush, form.fatiguePull, form.fatigueLegs].every(value => value !== "unknown") && strengthHistory.length > 0
+    const recoveryConfidence = recoveryInputs === 3 && sleepDebt3d !== null ? "高" : recoveryInputs >= 2 ? "中" : "低";
+    const strengthConfidence = !activityUncertain && !cyclingUncertain && recovery !== null && pain !== null && upperSoreness !== null && lowerSoreness !== null && [form.fatiguePush, form.fatiguePull, form.fatigueLegs].every(value => value !== "unknown") && strengthHistory.length > 0
       ? (warmupComplete ? "高" : "中") : "低";
     const aerobicConfidence = recovery !== null && pain !== null && form.symptoms !== "unknown"
       ? (warmupComplete && form.warmupHr !== "unknown" ? "高" : "中") : "低";
     return { hrvRatio, hrvRatioScore, hrvZ, hrvTrend, hrvTrendScore, hrvCv, hrvScore, sleepEfficiency, sleepDurationScore, sleepEfficiencyScore, sleepScore,
-      sleepDebt3d, subjectiveScore, warmupComplete, warmupStop, warmupDowngrade, recoveryConfidence, strengthConfidence, aerobicConfidence,
+      sleepDebt3d, sleepDebtPenalty, sleepDays3, subjectiveScore, warmupComplete, warmupStop, warmupDowngrade, recoveryConfidence, strengthConfidence, aerobicConfidence,
       rhrDelta, rhrScore, recovery, formValue, formScore, acwr, acwrScore, atlSpike, atlSpikeScore, fatigueMomentum, load, monotonyScore, densityScore, structure,
-      readiness, readinessLevel, completeness, completenessLabel, limits, neuralReady, neuralLimited, neuralStatus, neuralPressure, neuralTriggers, neuralKnownInputs, cnsFatigue, fatiguedLabels, fatigueSummary, fatigueScore, strengthFrequencyStatus, strengthScore, strengthGroupScores, aerobicScore, strengthReadiness,
-      cycling, cyclingScore, cyclingCooldown, cyclingTempoAllowed, cyclingLegBlock, cyclingRecheck, cyclingUncertain,
+      readiness, readinessLevel, completeness, completenessLabel, limits, neuralReady, neuralLimited, neuralStatus, neuralPressure, neuralTriggers, neuralKnownInputs, fatiguedLabels, fatigueSummary, fatigueScore, strengthFrequencyStatus, strengthScore, strengthGroupScores, aerobicScore, strengthReadiness,
+      cycling, cyclingScore, cyclingCooldown, cyclingTempoAllowed, cyclingLegBlock, cyclingRecheck, cyclingUncertain, activity, activityBlocks, activityUncertain, legLoad48, mixedLegRemainingHours, swimmingScore, boxingScore,
       aerobicReadiness, positives: positives.slice(0, 3), limitations: uniqueLimitations.slice(0, 3), allLimitations: uniqueLimitations, suggestionType,
-      decision: localRecoveryPlan ? "恢复性活动（腿部受限）" : decision, actionState: localRecoveryPlan ? "RECOVER" : actionState,
+      decision: localRecoveryPlan ? "恢复性活动（腿部受限）" : selectedDecision, actionState: localRecoveryPlan || /恢复|休息/.test(selectedDecision) ? "RECOVER" : selectedDecision === "降量训练" ? "MODIFY" : actionState,
       keyLimiter, dataWarnings, recommendationReason, plan: chosenPlan };
+}
+
+export function recordFirstSetFeedback(input: Partial<FormState>, key: "firstSetRir" | "firstSetWeight", value: string) {
+  const { form } = expireDailyValues(input);
+  const exercise = evaluateReadiness(form).plan.exercises[0];
+  if (!exercise) return form;
+  const base = form.firstSetExercise === exercise.calibrationId ? form : { ...form, firstSetRir: "", firstSetWeight: "" };
+  return updateFormField(updateFormField(base, "firstSetExercise", exercise.calibrationId), key, value);
 }
 
 export default function Home() {
@@ -1036,7 +1174,9 @@ export default function Home() {
             restored.fatiguePull = legacy === "unknown" ? "unknown" : ["pull", "upper", "full"].includes(legacy) ? "yes" : "no";
             restored.fatigueLegs = legacy === "unknown" ? "unknown" : ["legs", "lower", "full"].includes(legacy) ? "yes" : "no";
           }
-          setForm({ ...emptyForm, ...restored, date: today() });
+          const restoredToday = expireDailyValues(restored, today(), true);
+          setForm(restoredToday.form);
+          if (restoredToday.expired.length) setImportNotice("旧读数已退出今日评分，历史训练保留。请重新导入今日报告并填写体感。");
         } else {
           setForm(current => ({ ...current, date: today() }));
         }
@@ -1050,9 +1190,26 @@ export default function Home() {
   useEffect(() => {
     if (hydrated) window.localStorage.setItem("heracles-daily-v1", JSON.stringify(form));
   }, [form, hydrated]);
+  useEffect(() => {
+    if (!hydrated) return;
+    let calendarDate = today();
+    const checkDate = () => {
+      const nextDate = today();
+      if (nextDate === calendarDate) return;
+      const previousDate = calendarDate;
+      calendarDate = nextDate;
+      setForm(current => current.date === previousDate ? expireDailyValues(current, nextDate).form : current);
+      setImportNotice("日期已变化，请更新今日数据；过期读数不参与新一天的评分。");
+    };
+    const timer = window.setInterval(checkDate, 30_000);
+    window.addEventListener("focus", checkDate);
+    document.addEventListener("visibilitychange", checkDate);
+    return () => { window.clearInterval(timer); window.removeEventListener("focus", checkDate); document.removeEventListener("visibilitychange", checkDate); };
+  }, [hydrated]);
   const result = useMemo(() => evaluateReadiness(form), [form]);
 
-  const update = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm(current => ({ ...current, [key]: value }));
+  const update = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm(current => key === "firstSetRir" || key === "firstSetWeight"
+    ? recordFirstSetFeedback(current, key, String(value)) : updateFormField(current, key, value));
   const reset = () => { setForm({ ...emptyForm, date: today() }); setImportNotice(null); setLastImportFields([]); setImportAudit(null); setAuditOpen(false); window.localStorage.removeItem("heracles-daily-v1"); };
   const applyTextData = (source: string) => {
     if (!source.trim()) {
@@ -1067,12 +1224,7 @@ export default function Home() {
       setPasteStatus({ kind: "error", message: "没有识别到字段。请粘贴包含 HRV、RHR、ATL、CTL、睡眠等字段的文字报告；如果是截图，请先提取成文字。" });
       return;
     }
-    const resetUnknownSubjectives = /Workout list, each line is an entry of workout/i.test(source)
-      ? { neural: "unknown" as const, symptoms: "unknown" as const, pain: "", painArea: "", energy: "", fatigue: "", motivation: "", stress: "", upperSoreness: "", lowerSoreness: "", sleepQuality: "", warmupRpeDelta: "", warmupPain: "", warmupHr: "unknown" as const, movementQuality: "unknown" as const, warmupEnergy: "unknown" as const, firstSetRir: "", aerobicMinutes7: "", hardCycling36: "", evaluationAt: "", upperSets48: "", lowerSets48: "", pushSets48: "", pullSets48: "", legsSets48: "", pushSets7: "", pullSets7: "", legsSets7: "", strengthHistory: "", strengthFatigue: "unknown" as const, fatiguePush: "unknown" as const, fatiguePull: "unknown" as const, fatigueLegs: "unknown" as const }
-      : {};
-    setForm(current => ({ ...current, ...resetUnknownSubjectives,
-      ...(/Workout list, each line is an entry of workout/i.test(source) ? { cyclingHistory: "", cyclingAsOf: "", cyclingManualKind: "none" as const, cyclingManualEnd: "", workoutLoad: "", monotony: "", strain: "" } : {}),
-      ...parsed.values }));
+    setForm(current => applyImportedData(current, parsed, /Workout list, each line is an entry of workout/i.test(source)));
     const importedDate = parsed.values.date ? `（${parsed.values.date}）` : "";
     setImportNotice(`识别完成${importedDate}：已填入 ${parsed.fields.length} 项，准备度已更新。`);
     setLastImportFields(parsed.fields);
@@ -1314,17 +1466,16 @@ export default function Home() {
             <DashboardRow label="HRV trend" value={display(result.hrvTrend, "%", 2)} score={result.hrvTrendScore} note="相对3日前" />
             <DashboardRow label="HRV variability" value={display(result.hrvCv, "%", 2)} score={result.hrvScore} note="7日 CV" />
             <DashboardRow label="Sleep duration" value={form.sleep ? `${form.sleep} h` : "Unknown"} score={result.sleepScore} note={`效率 ${display(result.sleepEfficiency, "%", 1)}`} />
-            <DashboardRow label="3日睡眠债" value={display(result.sleepDebt3d, " h", 1)} score={result.sleepDebt3d === null ? null : result.sleepDebt3d <= 1 ? 85 : result.sleepDebt3d <= 3 ? 70 : 55} note={`3日均值 ${form.sleep3avg || "—"} h`} />
+            <DashboardRow label="3日睡眠债" value={display(result.sleepDebt3d, " h", 1)} score={result.sleepDebt3d === null ? null : result.sleepDebt3d <= 1 ? 85 : result.sleepDebt3d <= 3 ? 70 : 55} note={`每日目标7.5h · 有效${result.sleepDays3}/3天 · 按天含午睡均值 ${form.sleep3avg || "—"}h；睡眠分内修正${result.sleepDebtPenalty.toFixed(1)}分`} />
             <DashboardRow label="RHR delta" value={display(result.rhrDelta, " bpm", 1)} score={result.rhrScore} note={`${form.rhr || "—"} / ${form.rhrBaseline || "—"} bpm`} />
           </DashboardPanel>
 
-          <DashboardPanel icon={<Brain />} title="NEURAL SYSTEM">
+          <DashboardPanel icon={<Brain />} title="自主神经与热身">
             <DashboardRow label="HRV Z-score" value={display(result.hrvZ, "", 2)} score={result.hrvZ === null ? null : result.hrvZ >= 1 ? 95 : result.hrvZ >= -1 ? 85 : result.hrvZ >= -1.5 ? 70 : 55} />
             <SegmentMeter value={result.hrvZ === null ? null : Math.max(0, Math.min(100, (result.hrvZ + 3) / 6 * 100))} />
-            <DashboardRow label="Neural readiness" value={result.neuralStatus === "ready" ? "Ready" : result.neuralStatus === "limited" ? "Limited" : "Unknown"} score={result.neuralStatus === "ready" ? 85 : result.neuralStatus === "limited" ? 55 : null} note={`Pressure ${result.neuralPressure} · ${result.neuralTriggers}/${result.neuralKnownInputs}项可用`} />
+            <DashboardRow label="自主神经恢复信号" value={result.neuralStatus === "ready" ? "未见明显异常" : result.neuralStatus === "limited" ? "异常 / 主观受限" : "资料不足"} score={result.neuralStatus === "ready" ? 85 : result.neuralStatus === "limited" ? 55 : null} note={`HRV与RHR共${result.neuralKnownInputs}类资料可用，${result.neuralTriggers}类异常；HRV比值和Z分数合并判断`} />
             <SegmentMeter value={result.neuralStatus === "ready" ? 85 : result.neuralStatus === "limited" ? 55 : null} />
-            <DashboardRow label="CNS fatigue" value={result.cnsFatigue} score={result.cnsFatigue === "Yes" ? 40 : result.cnsFatigue === "No" ? 85 : null} note="缺失时保持Unknown，不自动限制" />
-            <SegmentMeter value={result.cnsFatigue === "Yes" ? 40 : result.cnsFatigue === "No" ? 85 : null} />
+            <DashboardRow label="训练表现复查" value={result.warmupStop ? "终止相关训练" : result.warmupDowngrade ? "需要降档" : result.warmupComplete ? "热身反馈完整" : "待完成热身反馈"} score={null} note="HRV与静息心率不用于诊断中枢疲劳" />
           </DashboardPanel>
 
           <DashboardPanel icon={<Dumbbell />} title="TRAINING LOAD">
@@ -1353,7 +1504,7 @@ export default function Home() {
         <p className="dashboard-note">评估时点 {form.evaluationAt.startsWith(form.date) ? form.evaluationAt : `${form.date} 09:00`}　｜　数据完整度 {result.completenessLabel} · {result.completeness}%　｜　{result.suggestionType}　｜　力量与有氧分数为模型估算，ACWR不参与评分；不代表 WHOOP、Garmin 官方算法或医学诊断。</p>
       </section>
 
-      <ReportSection icon={<Activity />} title="骑行与腿部恢复" subtitle={result.cyclingLegBlock ? "暂缓腿力量与强骑；其他部位独立判断" : "骑行负荷与力量组数分开记录"}>
+      <ReportSection icon={<Activity />} title="骑行与腿部恢复" subtitle={result.cyclingCooldown ? "暂缓腿力量与强骑；其他部位独立判断" : "骑行负荷与力量组数分开记录"}>
         <div className="analysis-card">
           <DashboardRow label="骑行专项准备度" value={display(result.cyclingScore, " / 100")} score={result.cyclingScore} note={result.cyclingTempoAllowed ? "当前允许有氧质量课" : "不安排节奏、阈值、冲刺或低踏频高阻力"} />
           <DashboardRow label="骑行恢复窗口" value={result.cycling.blocked ? `剩余约${Math.ceil(result.cycling.remainingHours)}小时` : result.cyclingRecheck ? "待体感与热身复查" : result.cyclingUncertain ? "资料不足" : "未触发计时限制"} score={null} note={result.cycling.reason || "到时不代表自动恢复；下肢酸痛和热身反馈仍优先"} />
@@ -1368,6 +1519,14 @@ export default function Home() {
             <p>{ride.reason}</p>
           </article>) : <p>{result.cyclingUncertain ? "尚无完整骑行记录，请重新粘贴原始导出。旧版只保存36小时次数，无法还原功率区间。" : "本次导入的近7日记录中未识别到骑行。"}</p>}
           <p>48小时/24小时及负荷阈值是保守排课默认值，不是医学测定的恢复时间。心率高区不等于无氧功率区；功率区间依赖正确的FTP设置。</p>
+        </details>
+        <details className="recommendation-reason">
+          <summary>其他专项活动与局部恢复</summary>
+          {(["push", "pull", "legs"] as const).map(group => <DashboardRow key={group} label={`${{ push: "推", pull: "拉", legs: "腿" }[group]}部位活动限制`}
+            value={result.activity.groups[group].blocked || group === "legs" && result.mixedLegRemainingHours > 0 ? `剩余约${Math.ceil(Math.max(result.activity.groups[group].remainingHours, group === "legs" ? result.mixedLegRemainingHours : 0))}小时` : result.activityBlocks[group] ? "待体感与热身复查" : result.activityUncertain ? "资料不完整" : "未触发限制"}
+            score={null} note={group === "legs" && result.mixedLegRemainingHours > 0 ? `骑行与其他腿部活动48小时已知负荷合计${result.legLoad48.toFixed(0)} AU` : result.activity.groups[group].reason || "爬楼、徒步、跑步、划船、游泳与拳击按相关部位判断"} />)}
+          {result.activity.sessions.map(session => <p key={`${session.type}-${session.start}-${session.duration}`}>{session.type} · {new Date(session.end).toISOString().slice(5, 16).replace("T", " ")}结束 · {session.duration}分钟 · RPE {session.rpe ?? "未知"} · {session.reason}</p>)}
+          <p>48/24小时与负荷阈值是保守排课默认值。活动负荷不折算力量组数，不重复加入ATL；缺失RPE保留未知，实际酸痛和热身反馈优先。</p>
         </details>
         <details className="input-card">
           <summary><Activity/><div><strong>补充漏记的强骑/冲刺</strong><span>无功率数据、平均心率没反映冲刺时使用</span></div></summary>
@@ -1420,7 +1579,8 @@ export default function Home() {
           {result.plan.title.includes("骑行") ? <CyclingSteps tempoAllowed={result.cyclingTempoAllowed} recovering={result.cyclingCooldown} dose={result.plan.dose} />
             : result.plan.targetGroup ? <>
               <ol><li>热身：10–15分钟动态活动，每个首个复合动作完成2–4组递增热身。</li><li>下面重量来自你最近一次可识别记录，并已按今日准备度降载；若设备或动作口径不同，以目标RPE和RIR为准。</li></ol>
-              <div className="rir-calibration"><div><span>首个正式组校准</span><strong>{form.firstSetRir === "" ? "完成第一组后填写 RIR" : `RIR ${form.firstSetRir}${form.firstSetRir === "5" ? "+" : ""} · 处方已更新`}</strong><small>整节训练RPE只作参考，不再触发自动加重。</small></div><div role="group" aria-label="首个正式组RIR">{[0,1,2,3,4,5].map(value => <button key={value} type="button" className={form.firstSetRir === String(value) ? "active" : ""} onClick={() => update("firstSetRir", form.firstSetRir === String(value) ? "" : String(value))}>{value === 5 ? "5+" : value}</button>)}</div></div>
+              <div className="rir-calibration"><div><span>首个正式组校准 · {result.plan.exercises[0]?.name}</span><strong>{form.firstSetRir === "" || form.firstSetExercise !== result.plan.exercises[0]?.calibrationId ? "完成第一组后填写 RIR" : `RIR ${form.firstSetRir}${form.firstSetRir === "5" ? "+" : ""} · 处方已更新`}</strong><small>只用于当前动作；降档日不突破今日重量上限。</small></div><div role="group" aria-label="首个正式组RIR">{[0,1,2,3,4,5].map(value => <button key={value} type="button" className={form.firstSetExercise === result.plan.exercises[0]?.calibrationId && form.firstSetRir === String(value) ? "active" : ""} onClick={() => update("firstSetRir", form.firstSetExercise === result.plan.exercises[0]?.calibrationId && form.firstSetRir === String(value) ? "" : String(value))}>{value === 5 ? "5+" : value}</button>)}</div></div>
+              {result.plan.exercises[0]?.unit !== "自重" ? <Field label="首组实际重量" value={form.firstSetExercise === result.plan.exercises[0]?.calibrationId ? form.firstSetWeight : ""} onChange={v => update("firstSetWeight", v)} unit={result.plan.exercises[0]?.unit ?? "kg"} /> : null}
               <div className="strength-prescription">
                 {result.plan.exercises.map((exercise, index) => <article key={`${exercise.name}-${index}`}><span>{String(index + 1).padStart(2,"0")}</span><div><strong>{exercise.name}</strong></div><b>{exercise.prescription}</b><em>RPE {exercise.rpe} · RIR {exercise.rir} · 休息 {exercise.rest}</em></article>)}
               </div>
@@ -1428,7 +1588,7 @@ export default function Home() {
               <p className="strength-rule">当首个正式组RPE高出目标≥2、疼痛增加或动作代偿时：重量再降10%–15%；疼痛＞3/10立即停止相关动作。</p>
             </>
             : result.plan.title.includes("游泳") ? <ol><li>热身：轻松技术划水，RPE 2–3。</li><li>主训练：以技术效率为主；肩部出现疼痛、无力或动作代偿时立即降量或结束。{result.cyclingCooldown ? "腿部恢复窗口内不做强力打腿或冲刺。" : ""}</li><li>按 {result.plan.dose} 执行，不安排全力冲刺或高乳酸组。</li><li>放松：轻松划水，结束后复查肩部感觉。</li></ol>
-            : result.plan.title.includes("拳击") ? <ol><li>热身：10–15 分钟步法、影子拳和关节动态活动。</li><li>主训练：距离、步法、组合技术和轻强度靶练为主，避免全力击打和高强度对抗。</li><li>按 {result.plan.dose} 执行；肩、肘、腕或神经疲劳信号升高时立即降档。</li><li>结束前用 5–8 分钟低强度技术动作恢复呼吸和节奏。</li></ol>
+            : result.plan.title.includes("拳击") ? <ol><li>热身：10–15 分钟步法、影子拳和关节动态活动。</li><li>主训练：距离、步法、组合技术和轻强度靶练为主，避免全力击打和高强度对抗。</li><li>按 {result.plan.dose} 执行；肩、肘、腕不适或热身反馈异常时立即降档。</li><li>结束前用 5–8 分钟低强度技术动作恢复呼吸和节奏。</li></ol>
             : <ol><li>先静息检查症状；胸痛、异常气短、头晕、神经症状或明显关节痛时完全休息并考虑就医。</li><li>仅在症状不加重时进行轻松步行、呼吸和灵活性练习。</li><li>全程 RPE 1–2，不追求时长、训练量或热量消耗。</li><li>任何不适增加立即终止。</li></ol>}
         </div>
       </ReportSection>
@@ -1478,8 +1638,8 @@ export default function Home() {
             <SelectField label="48h拉疲劳" value={form.fatiguePull} onChange={v => update("fatiguePull", v as FormState["fatiguePull"])} options={[["unknown","Unknown"],["no","可训练"],["yes","疲劳 / 回避"]]} />
             <SelectField label="48h腿疲劳" value={form.fatigueLegs} onChange={v => update("fatigueLegs", v as FormState["fatigueLegs"])} options={[["unknown","Unknown"],["no","可训练"],["yes","疲劳 / 回避"]]} />
           </InputCard>
-          <InputCard icon={<Brain />} title="主观状态与硬规则" subtitle="神经 · 症状 · 疼痛">
-            <SelectField label="Neural / CNS" value={form.neural} onChange={v => update("neural", v as FormState["neural"])} options={[["unknown","Unknown"],["normal","Normal"],["limited","Neural Limited"],["fatigue","CNS Fatigue"]]} />
+          <InputCard icon={<Brain />} title="主观状态与硬规则" subtitle="恢复体感 · 症状 · 疼痛">
+            <SelectField label="主观恢复状态" value={form.neural} onChange={v => update("neural", v as FormState["neural"])} options={[["unknown","未填写"],["normal","体感正常"],["limited","体感受限"],["fatigue","明显疲劳"]]} />
             <SelectField label="疾病症状" value={form.symptoms} onChange={v => update("symptoms", v as FormState["symptoms"])} options={[["unknown","Unknown"],["none","无"],["mild","轻微症状"],["acute","急性 / 明显症状"]]} />
             <Field label="疼痛评分" value={form.pain} onChange={v => update("pain", v)} unit="/10" step="1" />
             <label className="field"><span>疼痛 / 局部不适</span><Input value={form.painArea} onChange={e => update("painArea", e.target.value)} placeholder="如：右肩、左膝" /></label>
@@ -1503,7 +1663,7 @@ export default function Home() {
         </aside>
       </section>
       </details>
-      <footer><span>HERACLES DAILY · v4.8</span><span>纯前端规则引擎 · 数据仅保存在当前浏览器</span></footer>
+      <footer><span>HERACLES DAILY · v4.9</span><span>纯前端规则引擎 · 数据仅保存在当前浏览器</span></footer>
     </main>
   );
 }
